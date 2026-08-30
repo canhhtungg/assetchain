@@ -30,3 +30,17 @@ chainlaunch.db
 
 # OS
 .DS_Store
+# Build binaries
+client/assetclient
+client/client
+client/asset-backend
+assetcc/assetcc
+
+# ChainLaunch database
+data/*.db
+data/*.db-shm
+data/*.db-wal
+
+# Private keys / certificates
+*.key
+*.pem
