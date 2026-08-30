@@ -9,7 +9,6 @@ build/
 *.out
 
 # Build binaries
-assetcc
 asset-backend
 
 # Environment
@@ -44,3 +43,5 @@ data/*.db-wal
 # Private keys / certificates
 *.key
 *.pem
+# Chaincode binary
+assetcc/assetcc
