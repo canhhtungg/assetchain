@@ -1,0 +1,168 @@
+
+name: assetchannel
+version: 1.0.0
+
+client:
+  organization: Org1MSP
+  credentialStore:
+    path: /tmp/state-store
+    cryptoStore:
+      path: /tmp/msp
+
+organizations:
+  Org1MSP:
+    mspid: Org1MSP
+    certificateAuthorities:
+    - Org1MSP-ca
+    peers:
+      - peer0-org1msp
+      - peer1-org1msp
+
+    users:
+       admin: 
+          cert: 
+            pem: |
+                -----BEGIN CERTIFICATE-----
+                MIICRjCCAeygAwIBAgIRAPhs6rqPIGAmh46FeaqDmBwwCgYIKoZIzj0EAwIwgYAx
+                CzAJBgNVBAYTAlVTMRMwEQYDVQQIEwpDYWxpZm9ybmlhMRYwFAYDVQQHEw1TYW4g
+                RnJhbmNpc2NvMQkwBwYDVQQJEwAxEDAOBgNVBAoTB09yZzFNU1AxDTALBgNVBAsT
+                BFNJR04xGDAWBgNVBAMTD09yZzFNU1Atc2lnbi1jYTAeFw0yNjA4MTYxMDM0MDFa
+                Fw0yNzA4MTYxMDM1MDFaMIGEMQswCQYDVQQGEwJVUzETMBEGA1UECBMKQ2FsaWZv
+                cm5pYTEWMBQGA1UEBxMNU2FuIEZyYW5jaXNjbzEJMAcGA1UECRMAMRAwDgYDVQQK
+                EwdPcmcxTVNQMQ4wDAYDVQQLEwVhZG1pbjEbMBkGA1UEAxMST3JnMU1TUC1zaWdu
+                LWFkbWluMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEL/qEdj1TNv8h7ErIFvGw
+                2xuYnJ6MhyQnsYhCYJ9hdfx7vzKqVcqd8Kgq/BQj8nhNGCg5scYU7J+gsvQG5HOr
+                lKNBMD8wDgYDVR0PAQH/BAQDAgIEMAwGA1UdEwEB/wQCMAAwHwYDVR0jBBgwFoAU
+                TmFaDHKsVC0FlBOBRJTLXi6E75swCgYIKoZIzj0EAwIDSAAwRQIhAO0ZDHeXMaE+
+                za2wwe6Zv8btDpny0gEH+BIOsrZNbEdtAiBv7LcdLwYMB8LsItYcXZEu+u/6wETA
+                U/hha0kF8JVVUA==
+                -----END CERTIFICATE-----
+                
+          key:
+            pem: |
+                -----BEGIN PRIVATE KEY-----
+                MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg+SQ16lDnlHxtbUrR
+                ClzR5QKi0TnPFZx8y3yyynvXOXahRANCAAQv+oR2PVM2/yHsSsgW8bDbG5icnoyH
+                JCexiEJgn2F1/Hu/MqpVyp3wqCr8FCPyeE0YKDmxxhTsn6Cy9Abkc6uU
+                -----END PRIVATE KEY-----
+                
+
+orderers:
+  orderer0-org1msp:
+    url: grpcs://127.0.0.1:9000
+    tlsCACerts:
+      pem: |
+          -----BEGIN CERTIFICATE-----
+          MIICOzCCAeKgAwIBAgIQPvQvzV13P2Y0DLR0h6fHUTAKBggqhkjOPQQDAjB+MQsw
+          CQYDVQQGEwJVUzETMBEGA1UECBMKQ2FsaWZvcm5pYTEWMBQGA1UEBxMNU2FuIEZy
+          YW5jaXNjbzEJMAcGA1UECRMAMRAwDgYDVQQKEwdPcmcxTVNQMQwwCgYDVQQLEwNU
+          TFMxFzAVBgNVBAMTDk9yZzFNU1AtdGxzLWNhMB4XDTI2MDgxNjEwMzQwMVoXDTM2
+          MDgxMzEwMzUwMVowfjELMAkGA1UEBhMCVVMxEzARBgNVBAgTCkNhbGlmb3JuaWEx
+          FjAUBgNVBAcTDVNhbiBGcmFuY2lzY28xCTAHBgNVBAkTADEQMA4GA1UEChMHT3Jn
+          MU1TUDEMMAoGA1UECxMDVExTMRcwFQYDVQQDEw5PcmcxTVNQLXRscy1jYTBZMBMG
+          ByqGSM49AgEGCCqGSM49AwEHA0IABNL49JANCGRvgLEtXRlrNG4vBDx+buHjYYS7
+          s4+qysUskWRtoSUkVdme4QYrzH8gzVY450f69pRtIWMN+3719G6jQjBAMA4GA1Ud
+          DwEB/wQEAwIBBjAPBgNVHRMBAf8EBTADAQH/MB0GA1UdDgQWBBSy/A8vCD1TWl1o
+          qp4flo7barJv6jAKBggqhkjOPQQDAgNHADBEAiANMxwKHjpqeavPvhIMQMo4uYo6
+          XLX9wvkdV59b8+gV6gIgKecwt8b9M5kPj0U/D3JHSzozXdGw2OQ9TAbign/2QjE=
+          -----END CERTIFICATE-----
+          
+  orderer1-org1msp:
+    url: grpcs://127.0.0.1:9100
+    tlsCACerts:
+      pem: |
+          -----BEGIN CERTIFICATE-----
+          MIICOzCCAeKgAwIBAgIQPvQvzV13P2Y0DLR0h6fHUTAKBggqhkjOPQQDAjB+MQsw
+          CQYDVQQGEwJVUzETMBEGA1UECBMKQ2FsaWZvcm5pYTEWMBQGA1UEBxMNU2FuIEZy
+          YW5jaXNjbzEJMAcGA1UECRMAMRAwDgYDVQQKEwdPcmcxTVNQMQwwCgYDVQQLEwNU
+          TFMxFzAVBgNVBAMTDk9yZzFNU1AtdGxzLWNhMB4XDTI2MDgxNjEwMzQwMVoXDTM2
+          MDgxMzEwMzUwMVowfjELMAkGA1UEBhMCVVMxEzARBgNVBAgTCkNhbGlmb3JuaWEx
+          FjAUBgNVBAcTDVNhbiBGcmFuY2lzY28xCTAHBgNVBAkTADEQMA4GA1UEChMHT3Jn
+          MU1TUDEMMAoGA1UECxMDVExTMRcwFQYDVQQDEw5PcmcxTVNQLXRscy1jYTBZMBMG
+          ByqGSM49AgEGCCqGSM49AwEHA0IABNL49JANCGRvgLEtXRlrNG4vBDx+buHjYYS7
+          s4+qysUskWRtoSUkVdme4QYrzH8gzVY450f69pRtIWMN+3719G6jQjBAMA4GA1Ud
+          DwEB/wQEAwIBBjAPBgNVHRMBAf8EBTADAQH/MB0GA1UdDgQWBBSy/A8vCD1TWl1o
+          qp4flo7barJv6jAKBggqhkjOPQQDAgNHADBEAiANMxwKHjpqeavPvhIMQMo4uYo6
+          XLX9wvkdV59b8+gV6gIgKecwt8b9M5kPj0U/D3JHSzozXdGw2OQ9TAbign/2QjE=
+          -----END CERTIFICATE-----
+          
+  orderer2-org1msp:
+    url: grpcs://127.0.0.1:9200
+    tlsCACerts:
+      pem: |
+          -----BEGIN CERTIFICATE-----
+          MIICOzCCAeKgAwIBAgIQPvQvzV13P2Y0DLR0h6fHUTAKBggqhkjOPQQDAjB+MQsw
+          CQYDVQQGEwJVUzETMBEGA1UECBMKQ2FsaWZvcm5pYTEWMBQGA1UEBxMNU2FuIEZy
+          YW5jaXNjbzEJMAcGA1UECRMAMRAwDgYDVQQKEwdPcmcxTVNQMQwwCgYDVQQLEwNU
+          TFMxFzAVBgNVBAMTDk9yZzFNU1AtdGxzLWNhMB4XDTI2MDgxNjEwMzQwMVoXDTM2
+          MDgxMzEwMzUwMVowfjELMAkGA1UEBhMCVVMxEzARBgNVBAgTCkNhbGlmb3JuaWEx
+          FjAUBgNVBAcTDVNhbiBGcmFuY2lzY28xCTAHBgNVBAkTADEQMA4GA1UEChMHT3Jn
+          MU1TUDEMMAoGA1UECxMDVExTMRcwFQYDVQQDEw5PcmcxTVNQLXRscy1jYTBZMBMG
+          ByqGSM49AgEGCCqGSM49AwEHA0IABNL49JANCGRvgLEtXRlrNG4vBDx+buHjYYS7
+          s4+qysUskWRtoSUkVdme4QYrzH8gzVY450f69pRtIWMN+3719G6jQjBAMA4GA1Ud
+          DwEB/wQEAwIBBjAPBgNVHRMBAf8EBTADAQH/MB0GA1UdDgQWBBSy/A8vCD1TWl1o
+          qp4flo7barJv6jAKBggqhkjOPQQDAgNHADBEAiANMxwKHjpqeavPvhIMQMo4uYo6
+          XLX9wvkdV59b8+gV6gIgKecwt8b9M5kPj0U/D3JHSzozXdGw2OQ9TAbign/2QjE=
+          -----END CERTIFICATE-----
+          
+
+peers:
+  peer0-org1msp:
+    url: grpcs://127.0.0.1:7000
+    tlsCACerts:
+      pem: |
+          -----BEGIN CERTIFICATE-----
+          MIICOzCCAeKgAwIBAgIQPvQvzV13P2Y0DLR0h6fHUTAKBggqhkjOPQQDAjB+MQsw
+          CQYDVQQGEwJVUzETMBEGA1UECBMKQ2FsaWZvcm5pYTEWMBQGA1UEBxMNU2FuIEZy
+          YW5jaXNjbzEJMAcGA1UECRMAMRAwDgYDVQQKEwdPcmcxTVNQMQwwCgYDVQQLEwNU
+          TFMxFzAVBgNVBAMTDk9yZzFNU1AtdGxzLWNhMB4XDTI2MDgxNjEwMzQwMVoXDTM2
+          MDgxMzEwMzUwMVowfjELMAkGA1UEBhMCVVMxEzARBgNVBAgTCkNhbGlmb3JuaWEx
+          FjAUBgNVBAcTDVNhbiBGcmFuY2lzY28xCTAHBgNVBAkTADEQMA4GA1UEChMHT3Jn
+          MU1TUDEMMAoGA1UECxMDVExTMRcwFQYDVQQDEw5PcmcxTVNQLXRscy1jYTBZMBMG
+          ByqGSM49AgEGCCqGSM49AwEHA0IABNL49JANCGRvgLEtXRlrNG4vBDx+buHjYYS7
+          s4+qysUskWRtoSUkVdme4QYrzH8gzVY450f69pRtIWMN+3719G6jQjBAMA4GA1Ud
+          DwEB/wQEAwIBBjAPBgNVHRMBAf8EBTADAQH/MB0GA1UdDgQWBBSy/A8vCD1TWl1o
+          qp4flo7barJv6jAKBggqhkjOPQQDAgNHADBEAiANMxwKHjpqeavPvhIMQMo4uYo6
+          XLX9wvkdV59b8+gV6gIgKecwt8b9M5kPj0U/D3JHSzozXdGw2OQ9TAbign/2QjE=
+          -----END CERTIFICATE-----
+          
+  peer1-org1msp:
+    url: grpcs://127.0.0.1:7100
+    tlsCACerts:
+      pem: |
+          -----BEGIN CERTIFICATE-----
+          MIICOzCCAeKgAwIBAgIQPvQvzV13P2Y0DLR0h6fHUTAKBggqhkjOPQQDAjB+MQsw
+          CQYDVQQGEwJVUzETMBEGA1UECBMKQ2FsaWZvcm5pYTEWMBQGA1UEBxMNU2FuIEZy
+          YW5jaXNjbzEJMAcGA1UECRMAMRAwDgYDVQQKEwdPcmcxTVNQMQwwCgYDVQQLEwNU
+          TFMxFzAVBgNVBAMTDk9yZzFNU1AtdGxzLWNhMB4XDTI2MDgxNjEwMzQwMVoXDTM2
+          MDgxMzEwMzUwMVowfjELMAkGA1UEBhMCVVMxEzARBgNVBAgTCkNhbGlmb3JuaWEx
+          FjAUBgNVBAcTDVNhbiBGcmFuY2lzY28xCTAHBgNVBAkTADEQMA4GA1UEChMHT3Jn
+          MU1TUDEMMAoGA1UECxMDVExTMRcwFQYDVQQDEw5PcmcxTVNQLXRscy1jYTBZMBMG
+          ByqGSM49AgEGCCqGSM49AwEHA0IABNL49JANCGRvgLEtXRlrNG4vBDx+buHjYYS7
+          s4+qysUskWRtoSUkVdme4QYrzH8gzVY450f69pRtIWMN+3719G6jQjBAMA4GA1Ud
+          DwEB/wQEAwIBBjAPBgNVHRMBAf8EBTADAQH/MB0GA1UdDgQWBBSy/A8vCD1TWl1o
+          qp4flo7barJv6jAKBggqhkjOPQQDAgNHADBEAiANMxwKHjpqeavPvhIMQMo4uYo6
+          XLX9wvkdV59b8+gV6gIgKecwt8b9M5kPj0U/D3JHSzozXdGw2OQ9TAbign/2QjE=
+          -----END CERTIFICATE-----
+          
+
+channels:
+  assetchannel:
+    orderers:
+    - orderer0-org1msp
+    - orderer1-org1msp
+    - orderer2-org1msp
+    peers:
+      peer0-org1msp:
+         discover: true
+         endorsingPeer: true
+         chaincodeQuery: true
+         ledgerQuery: true
+         eventSource: true
+      peer1-org1msp:
+         discover: true
+         endorsingPeer: true
+         chaincodeQuery: true
+         ledgerQuery: true
+         eventSource: true
+

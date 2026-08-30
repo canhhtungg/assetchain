@@ -1,0 +1,32 @@
+# Node
+node_modules/
+dist/
+build/
+
+# Go
+*.exe
+*.test
+*.out
+
+# Build binaries
+assetcc
+asset-backend
+
+# Environment
+.env
+.env.*
+
+# Fabric / certificates / private keys
+*.key
+*.pem
+*.crt
+
+# ChainLaunch
+.chainlaunch/
+chainlaunch.db
+
+# Logs
+*.log
+
+# OS
+.DS_Store
