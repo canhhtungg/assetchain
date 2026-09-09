@@ -111,7 +111,16 @@ function App() {
 
   const [loading, setLoading] =
     useState(false);
+    
+useEffect(() => {
+  if (!notice) return;
 
+  const timer = setTimeout(() => {
+    setNotice("");
+  }, 3000);
+
+  return () => clearTimeout(timer);
+}, [notice]);
 
   useEffect(() => {
     localStorage.setItem(
@@ -1603,7 +1612,8 @@ function App() {
 
 
       {selected &&
-        page === "assets" && (
+	  page === "assets" &&
+	  modal !== "transfer" && (
           <div
             className="drawer-backdrop"
             onClick={() =>
@@ -1735,15 +1745,13 @@ function App() {
               <div className="drawer-actions">
 
                 <button
-                  className="primary-button"
-                  onClick={() =>
-                    setModal(
-                      "transfer"
-                    )
-                  }
-                >
-                  Chuyển quyền
-                </button>
+	  className="primary-button"
+	  onClick={() => {
+	    setModal("transfer");
+	  }}
+	>
+	  Chuyển quyền
+	</button>
 
 
                 <button
