@@ -29,6 +29,9 @@ func main() {
 		CCID:    ccID,
 		Address: address,
 		CC:      cc,
+		TLSProps: shim.TLSProperties{
+			Disabled: true,
+		},
 	}
 
 	if err := server.Start(); err != nil {

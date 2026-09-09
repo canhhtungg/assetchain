@@ -1,47 +1,59 @@
+# =========================
 # Node
+# =========================
 node_modules/
 dist/
-build/
+.vite/
 
-# Go
-*.exe
-*.test
-*.out
-
-# Build binaries
-asset-backend
-
-# Environment
+# Environment variables
 .env
 .env.*
+!.env.example
 
-# Fabric / certificates / private keys
-*.key
-*.pem
-*.crt
+# =========================
+# Go
+# =========================
+*.exe
+*.out
+*.test
 
-# ChainLaunch
-.chainlaunch/
-chainlaunch.db
+# Binary files
+assetcc
 
+# =========================
 # Logs
+# =========================
 *.log
+logs/
 
+# =========================
 # OS
+# =========================
 .DS_Store
-# Build binaries
-client/assetclient
-client/client
-client/asset-backend
-assetcc/assetcc
+Thumbs.db
 
-# ChainLaunch database
-data/*.db
-data/*.db-shm
-data/*.db-wal
+# =========================
+# IDE
+# =========================
+.vscode/
+.idea/
 
-# Private keys / certificates
+# =========================
+# Hyperledger / ChainLaunch
+# =========================
+wallet/
+crypto-config/
+network-config.yaml
+
+# Private certificates / keys
 *.key
 *.pem
-# Chaincode binary
-assetcc/assetcc
+*_sk
+
+# =========================
+# Python
+# =========================
+__pycache__/
+*.pyc
+venv/
+.venv/

@@ -347,7 +347,7 @@ func (s *SmartContract) GetAssetsByOwner(
 			return nil, err
 		}
 
-		// Ignore User records.
+		// Bỏ qua User
 		if len(queryResponse.Key) >= 5 &&
 			queryResponse.Key[:5] == "USER_" {
 			continue
@@ -355,13 +355,25 @@ func (s *SmartContract) GetAssetsByOwner(
 
 		var asset Asset
 
-		err = json.Unmarshal(queryResponse.Value, &asset)
+		err = json.Unmarshal(
+			queryResponse.Value,
+			&asset,
+		)
+
 		if err != nil {
 			continue
 		}
 
+		// Bỏ qua dữ liệu không phải Asset
+		if asset.ID == "" {
+			continue
+		}
+
 		if asset.OwnerID == ownerID {
-			assets = append(assets, &asset)
+			assets = append(
+				assets,
+				&asset,
+			)
 		}
 	}
 
@@ -372,6 +384,7 @@ func (s *SmartContract) GetAssetsByOwner(
 // GET ALL ASSETS
 // ================================
 
+// GetAllAssets returns all assets.
 func (s *SmartContract) GetAllAssets(
 	ctx contractapi.TransactionContextInterface,
 ) ([]*Asset, error) {
@@ -392,7 +405,7 @@ func (s *SmartContract) GetAllAssets(
 			return nil, err
 		}
 
-		// Ignore User records.
+		// Bỏ qua dữ liệu User
 		if len(queryResponse.Key) >= 5 &&
 			queryResponse.Key[:5] == "USER_" {
 			continue
@@ -400,12 +413,25 @@ func (s *SmartContract) GetAllAssets(
 
 		var asset Asset
 
-		err = json.Unmarshal(queryResponse.Value, &asset)
+		err = json.Unmarshal(
+			queryResponse.Value,
+			&asset,
+		)
+
+		// Nếu dữ liệu không đúng định dạng Asset thì bỏ qua
 		if err != nil {
 			continue
 		}
 
-		assets = append(assets, &asset)
+		// Chỉ nhận dữ liệu thực sự là Asset
+		if asset.ID == "" {
+			continue
+		}
+
+		assets = append(
+			assets,
+			&asset,
+		)
 	}
 
 	return assets, nil
@@ -465,7 +491,60 @@ func (s *SmartContract) GetAssetHistory(
 
 	return history, nil
 }
+// ================================
+// GET ALL USERS
+// ================================
+/// GetAllUsers returns all users.
+func (s *SmartContract) GetAllUsers(
+	ctx contractapi.TransactionContextInterface,
+) ([]*User, error) {
 
+	resultsIterator, err := ctx.GetStub().GetStateByRange("", "")
+	if err != nil {
+		return nil, err
+	}
+
+	defer resultsIterator.Close()
+
+	var users []*User
+
+	for resultsIterator.HasNext() {
+
+		queryResponse, err := resultsIterator.Next()
+		if err != nil {
+			return nil, err
+		}
+
+		// Chỉ lấy các key bắt đầu bằng USER_
+		if len(queryResponse.Key) < 5 ||
+			queryResponse.Key[:5] != "USER_" {
+			continue
+		}
+
+		var user User
+
+		err = json.Unmarshal(
+			queryResponse.Value,
+			&user,
+		)
+
+		if err != nil {
+			continue
+		}
+
+		// Chỉ thêm User hợp lệ
+		if user.ID == "" {
+			continue
+		}
+
+		users = append(
+			users,
+			&user,
+		)
+	}
+
+	return users, nil
+}
 // ================================
 // INIT LEDGER
 // ================================
