@@ -593,3 +593,4 @@ func (s *SmartContract) InitLedger(
 
 	return nil
 }
+
