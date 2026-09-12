@@ -277,21 +277,6 @@ function App() {
   const [users, setUsers] =
     useState([]);
 
-  const [transactions, setTransactions] =
-    useState(() => {
-      try {
-        return (
-          JSON.parse(
-            localStorage.getItem(
-              "assetchain-transactions"
-            )
-          ) || []
-        );
-      } catch {
-        return [];
-      }
-    });
-
   const [network, setNetwork] =
     useState(null);
 
@@ -315,6 +300,12 @@ function App() {
 
   const [loading, setLoading] =
     useState(false);
+
+  const [confirmDialog, setConfirmDialog] = useState(null);
+
+  const [blockchainHistory, setBlockchainHistory] = useState([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState("");
 
   const [currentUser, setCurrentUser] = useState(() => {
     try {
@@ -385,13 +376,6 @@ useEffect(() => {
 
   return () => clearTimeout(timer);
 }, [notice]);
-
-  useEffect(() => {
-    localStorage.setItem(
-      "assetchain-transactions",
-      JSON.stringify(transactions)
-    );
-  }, [transactions]);
 
 
   /*
@@ -701,29 +685,238 @@ useEffect(() => {
 
   /*
    * =====================================================
-   * TRANSACTION HISTORY
+   * BLOCKCHAIN HISTORY
    * =====================================================
+   * Lịch sử hiển thị trực tiếp từ GetAssetHistory trên Fabric.
+   * Không còn sử dụng localStorage làm nguồn dữ liệu giao dịch.
    */
 
-  const addTransaction = (action, asset, detail = "", meta = {}) => {
-    setTransactions((previous) => [
-      {
-        id: "TX-" + Date.now(),
-        action,
-        assetID: asset.id,
-        assetName: asset.name,
-        ownerID: meta.ownerID || asset.ownerID || "",
-        fromOwnerID: meta.fromOwnerID || "",
-        toOwnerID: meta.toOwnerID || "",
-        actorID: currentUser?.id || "",
-        actorUsername: currentUser?.username || "",
-        detail,
-        time: new Date().toLocaleString("vi-VN"),
-      },
-      ...previous,
-    ]);
+  const formatBlockchainTimestamp = (timestamp) => {
+    if (timestamp === null || timestamp === undefined || timestamp === "") {
+      return { display: "Không có timestamp", value: 0 };
+    }
+
+    let seconds = 0;
+    let nanos = 0;
+
+    if (typeof timestamp === "object") {
+      seconds = Number(timestamp.seconds ?? timestamp.Seconds ?? 0);
+      nanos = Number(timestamp.nanos ?? timestamp.Nanos ?? 0);
+    } else if (typeof timestamp === "number") {
+      seconds = timestamp;
+    } else if (typeof timestamp === "string") {
+      const trimmed = timestamp.trim();
+
+      // GetAssetHistory của chaincode có thể trả timestamp dưới dạng
+      // chuỗi protobuf, ví dụ: "seconds:1789237977 nanos:683848285".
+      // Trường hợp này không thể dùng Date.parse(), nên phải tách
+      // seconds/nanos thủ công trước khi chuyển sang Date.
+      const protobufMatch = trimmed.match(
+        /seconds\s*:\s*(-?\d+(?:\.\d+)?)\s+nanos\s*:\s*(-?\d+(?:\.\d+)?)/i
+      );
+
+      if (protobufMatch) {
+        seconds = Number(protobufMatch[1]);
+        nanos = Number(protobufMatch[2]);
+      } else if (/^-?\d+(?:\.\d+)?$/.test(trimmed)) {
+        seconds = Number(trimmed);
+      } else {
+        const parsed = Date.parse(trimmed);
+        if (!Number.isNaN(parsed)) {
+          return {
+            display: new Date(parsed).toLocaleString("vi-VN", {
+              timeZone: "Asia/Ho_Chi_Minh",
+              day: "2-digit",
+              month: "2-digit",
+              year: "numeric",
+              hour: "2-digit",
+              minute: "2-digit",
+              second: "2-digit",
+            }),
+            value: parsed,
+          };
+        }
+
+        try {
+          const parsedObject = JSON.parse(trimmed);
+          return formatBlockchainTimestamp(parsedObject);
+        } catch {
+          return { display: "Không có timestamp", value: 0 };
+        }
+      }
+    }
+
+    if (!Number.isFinite(seconds) || seconds === 0) {
+      return { display: "Không có timestamp", value: 0 };
+    }
+
+    // Fabric timestamp dùng Unix seconds + nanos.
+    const milliseconds = seconds * 1000 + Math.floor(nanos / 1000000);
+    const date = new Date(milliseconds);
+
+    if (Number.isNaN(date.getTime())) {
+      return { display: "Không có timestamp", value: 0 };
+    }
+
+    return {
+      display: date.toLocaleString("vi-VN", {
+        timeZone: "Asia/Ho_Chi_Minh",
+        day: "2-digit",
+        month: "2-digit",
+        year: "numeric",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+      }),
+      value: milliseconds,
+    };
   };
 
+  const shortenTxId = (txId) => {
+    if (!txId) return "-";
+    if (txId.length <= 22) return txId;
+    return `${txId.slice(0, 10)}...${txId.slice(-8)}`;
+  };
+
+  const normalizeHistoryRecord = (record, index, previousAsset = null) => {
+    let value =
+      record?.value ??
+      record?.Value ??
+      record?.asset ??
+      record?.Asset ??
+      {};
+
+    if (typeof value === "string") {
+      try {
+        value = JSON.parse(value);
+      } catch {
+        value = {};
+      }
+    }
+
+    const txId =
+      record?.txId ??
+      record?.TxId ??
+      record?.txID ??
+      record?.TxID ??
+      record?.transactionId ??
+      record?.TransactionID ??
+      `HISTORY-${index + 1}`;
+
+    const timestamp =
+      record?.timestamp ??
+      record?.Timestamp ??
+      record?.time ??
+      record?.Time ??
+      "";
+
+    const isDelete = Boolean(
+      record?.isDelete ??
+      record?.IsDelete ??
+      record?.deleted ??
+      record?.Deleted
+    );
+
+    const currentOwner = value?.ownerID || value?.OwnerID || "";
+    const previousOwner = previousAsset?.ownerID || "";
+
+    let action = "Cập nhật";
+    if (isDelete) {
+      action = "Xóa tài sản";
+    } else if (index === 0) {
+      action = "Tạo tài sản";
+    } else if (currentOwner && previousOwner && currentOwner !== previousOwner) {
+      action = "Chuyển quyền sở hữu";
+    }
+
+    const formattedTimestamp = formatBlockchainTimestamp(timestamp);
+
+    return {
+      id: txId,
+      txId,
+      action,
+      assetID: value?.id || value?.ID || record?.assetID || "",
+      assetName: value?.name || value?.Name || "Tài sản",
+      ownerID: currentOwner,
+      value: Number(value?.value || value?.Value || 0),
+      status: value?.status || value?.Status || "",
+      serialNumber: value?.serialNumber || value?.SerialNumber || "",
+      detail: isDelete
+        ? "Tài sản đã được xóa trên Blockchain"
+        : currentOwner && previousOwner && currentOwner !== previousOwner
+        ? `${previousOwner} → ${currentOwner}`
+        : "Dữ liệu tài sản được ghi nhận trên Blockchain",
+      time: formattedTimestamp.display,
+      timeValue: formattedTimestamp.value,
+      raw: record,
+    };
+  };
+
+  const loadBlockchainHistory = async () => {
+    if (!currentUser) return;
+
+    const historyAssets = visibleAssets;
+
+    if (!historyAssets.length) {
+      setBlockchainHistory([]);
+      setHistoryError("");
+      return;
+    }
+
+    try {
+      setHistoryLoading(true);
+      setHistoryError("");
+
+      const results = await Promise.all(
+        historyAssets.map(async (asset) => {
+          try {
+            const data = await invokeChaincode("GetAssetHistory", [asset.id]);
+            const result = parseChaincodeResult(data, []);
+            const records = Array.isArray(result) ? result : [];
+
+            let previous = null;
+
+            const normalized = records.map((record, index) => {
+              const item = normalizeHistoryRecord(record, index, previous);
+              if (!record?.isDelete && !record?.IsDelete) {
+                previous = {
+                  ownerID: item.ownerID,
+                };
+              }
+              return {
+                ...item,
+                assetID: item.assetID || asset.id,
+                assetName: item.assetName || asset.name,
+              };
+            });
+
+            return normalized;
+          } catch (error) {
+            console.error(`GetAssetHistory ${asset.id}:`, error);
+            return [];
+          }
+        })
+      );
+
+      const flattened = results.flat();
+
+      flattened.sort((a, b) => b.timeValue - a.timeValue);
+
+      setBlockchainHistory(flattened);
+    } catch (error) {
+      console.error("Load blockchain history error:", error);
+      setHistoryError(error.message || "Không thể tải lịch sử Blockchain");
+      setBlockchainHistory([]);
+    } finally {
+      setHistoryLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (page === "transactions" && currentUser) {
+      loadBlockchainHistory();
+    }
+  }, [page, currentUser, visibleAssets]);
 
   /*
    * =====================================================
@@ -805,12 +998,81 @@ useEffect(() => {
 
   /*
    * =====================================================
+   * INPUT VALIDATION
+   * =====================================================
+   */
+
+  const validateAssetForm = (form, isEdit) => {
+    const id = form.id?.trim() || "";
+    const name = form.name?.trim() || "";
+    const type = form.type || "";
+    const ownerID = isAdmin
+      ? form.ownerID?.trim() || ""
+      : currentUser?.id || "";
+    const value = parseAssetValue(form.value);
+    const serialNumber = form.serialNumber?.trim() || "";
+    const description = form.description?.trim() || "";
+
+    if (!id) return "Mã tài sản không được để trống";
+    if (id.length < 4 || id.length > 40) {
+      return "Mã tài sản phải có từ 4 đến 40 ký tự";
+    }
+    if (!/^[A-Za-z0-9_-]+$/.test(id)) {
+      return "Mã tài sản chỉ được chứa chữ cái, số, dấu gạch ngang hoặc gạch dưới";
+    }
+
+    if (!name) return "Tên tài sản không được để trống";
+    if (name.length < 2 || name.length > 100) {
+      return "Tên tài sản phải có từ 2 đến 100 ký tự";
+    }
+
+    const allowedTypes = ["Computer", "Phone", "Vehicle", "Other"];
+    if (!allowedTypes.includes(type)) {
+      return "Loại tài sản không hợp lệ";
+    }
+
+    if (!ownerID) return "Chủ sở hữu không được để trống";
+    if (!users.some((user) => user.id === ownerID)) {
+      return `User ${ownerID} chưa tồn tại trên Blockchain`;
+    }
+
+    if (!Number.isSafeInteger(value) || value <= 0) {
+      return "Giá trị tài sản phải là số nguyên lớn hơn 0";
+    }
+    if (value > 9000000000000000) {
+      return "Giá trị tài sản vượt quá giới hạn cho phép";
+    }
+
+    if (serialNumber.length > 100) {
+      return "Serial Number không được vượt quá 100 ký tự";
+    }
+
+    if (description.length > 500) {
+      return "Mô tả không được vượt quá 500 ký tự";
+    }
+
+    if (!isEdit && id.length < 4) {
+      return "Mã tài sản không hợp lệ";
+    }
+
+    return "";
+  };
+
+
+  /*
+   * =====================================================
    * CREATE / UPDATE ASSET
    * =====================================================
    */
 
   const saveAsset = async (form) => {
     const isEdit = Boolean(editing);
+
+    const validationError = validateAssetForm(form, isEdit);
+    if (validationError) {
+      setNotice(validationError);
+      return;
+    }
 
     if (isEdit && !isAdmin && editing?.ownerID !== currentUser?.id) {
       setNotice("Bạn chỉ có thể chỉnh sửa tài sản của chính mình");
@@ -867,20 +1129,15 @@ useEffect(() => {
       }
 
       await loadAssets();
-      addTransaction(
-        isEdit ? "Cập nhật tài sản" : "Thêm tài sản",
-        asset,
-        isEdit
-          ? `Đã sửa thông tin tài sản • Chủ sở hữu: ${asset.ownerID}`
-          : `Chủ sở hữu: ${asset.ownerID}`,
-        { ownerID: asset.ownerID }
-      );
 
       setNotice(
         isEdit
           ? "Đã cập nhật tài sản trên Blockchain"
           : "Đã thêm tài sản vào Blockchain"
       );
+      if (page === "transactions") {
+        await loadBlockchainHistory();
+      }
       setModal(null);
       setEditing(null);
     } catch (error) {
@@ -898,70 +1155,68 @@ useEffect(() => {
    * =====================================================
    */
 
-  const deleteAsset =
-    async (asset) => {
-      const isOwner = asset?.ownerID === currentUser?.id;
+  const executeDeleteAsset = async (asset) => {
+    try {
+      setLoading(true);
 
-      // Admin được xóa mọi tài sản, User chỉ được xóa tài sản của chính mình.
-      if (!isAdmin && !isOwner) {
-        setNotice(
-          "Bạn chỉ có thể xóa tài sản do chính mình sở hữu"
-        );
-        return;
-      }
+      await invokeChaincode("DeleteAsset", [asset.id]);
+      await loadAssets();
 
-      if (
-        !window.confirm(
-          `Xóa tài sản ${asset.name}?\n\nThao tác này sẽ xóa tài sản khỏi Blockchain.`
-        )
-      ) {
-        return;
-      }
+      setNotice("Đã xóa tài sản khỏi Blockchain");
+      setSelected(null);
+      setConfirmDialog(null);
+    } catch (error) {
+      console.error(error);
+      setNotice(`Lỗi Blockchain: ${error.message}`);
+    } finally {
+      setLoading(false);
+    }
+  };
 
-      try {
-        setLoading(true);
+  const deleteAsset = async (asset) => {
+    const isOwner = asset?.ownerID === currentUser?.id;
 
-        await invokeChaincode(
-          "DeleteAsset",
-          [
-            asset.id,
-          ]
-        );
+    if (!isAdmin && !isOwner) {
+      setNotice("Bạn chỉ có thể xóa tài sản do chính mình sở hữu");
+      return;
+    }
 
-        await loadAssets();
-
-
-        addTransaction(
-          "Xóa tài sản",
-          asset,
-          `Chủ sở hữu: ${asset.ownerID}`,
-          { ownerID: asset.ownerID }
-        );
-
-
-        setNotice(
-          "Đã xóa tài sản khỏi Blockchain"
-        );
-
-
-        setSelected(null);
-      } catch (error) {
-        console.error(error);
-
-        setNotice(
-          `Lỗi Blockchain: ${error.message}`
-        );
-      } finally {
-        setLoading(false);
-      }
-    };
-
+    setConfirmDialog({
+      title: "Xác nhận xóa tài sản",
+      message: `Bạn có chắc chắn muốn xóa tài sản “${asset?.name || asset?.id}”?\n\nMã tài sản: ${asset?.id}\nGiá trị: ${money(asset?.value)}\n\nThao tác này sẽ xóa tài sản khỏi Blockchain.`,
+      confirmText: "Xóa tài sản",
+      danger: true,
+      onConfirm: () => executeDeleteAsset(asset),
+    });
+  };
 
   /*
    * =====================================================
    * TRANSFER ASSET
    * =====================================================
    */
+
+  const executeTransferAsset = async (ownerID) => {
+    if (!selected) return;
+
+    try {
+      setLoading(true);
+      await invokeChaincode("TransferAsset", [selected.id, ownerID]);
+
+      const updated = { ...selected, ownerID };
+      await loadAssets();
+
+      setNotice("Đã chuyển quyền sở hữu trên Blockchain");
+      setModal(null);
+      setSelected(null);
+      setConfirmDialog(null);
+    } catch (error) {
+      console.error(error);
+      setNotice(`Lỗi Blockchain: ${error.message}`);
+    } finally {
+      setLoading(false);
+    }
+  };
 
   const transferAsset = async (ownerID) => {
     if (!selected) return;
@@ -981,28 +1236,15 @@ useEffect(() => {
       return;
     }
 
-    try {
-      setLoading(true);
-      const oldOwner = selected.ownerID;
-      await invokeChaincode("TransferAsset", [selected.id, ownerID]);
+    const recipient = users.find((user) => user.id === ownerID);
 
-      const updated = { ...selected, ownerID };
-      await loadAssets();
-      addTransaction(
-        "Chuyển quyền sở hữu",
-        updated,
-        `${oldOwner} → ${ownerID}`,
-        { fromOwnerID: oldOwner, toOwnerID: ownerID, ownerID }
-      );
-      setNotice("Đã chuyển quyền sở hữu trên Blockchain");
-      setModal(null);
-      setSelected(null);
-    } catch (error) {
-      console.error(error);
-      setNotice(`Lỗi Blockchain: ${error.message}`);
-    } finally {
-      setLoading(false);
-    }
+    setConfirmDialog({
+      title: "Xác nhận chuyển quyền",
+      message: `Bạn có chắc chắn muốn chuyển tài sản “${selected.name}”?\n\nMã tài sản: ${selected.id}\n\nChủ sở hữu hiện tại:\n${selected.ownerID}\n\nChủ sở hữu mới:\n${recipient?.fullName || recipient?.username || recipient?.id} (${recipient?.id})\n\nSau khi xác nhận, quyền sở hữu sẽ được ghi lên Blockchain.`,
+      confirmText: "Xác nhận chuyển",
+      danger: false,
+      onConfirm: () => executeTransferAsset(ownerID),
+    });
   };
 
   const verifyTransferUser = async (userID) => {
@@ -1398,22 +1640,7 @@ useEffect(() => {
     };
 
 
-  // User chỉ được xem giao dịch có liên quan trực tiếp đến chính mình.
-  // KHÔNG lọc theo assetID vì hai User có thể đã từng nhập trùng mã tài sản
-  // trong lịch sử cũ; lọc theo assetID sẽ làm lộ giao dịch của người khác.
-  const visibleTransactions = useMemo(() => {
-    if (isAdmin) return transactions;
-
-    const userID = currentUser?.id;
-    if (!userID) return [];
-
-    return transactions.filter((transaction) =>
-      transaction.actorID === userID ||
-      transaction.ownerID === userID ||
-      transaction.fromOwnerID === userID ||
-      transaction.toOwnerID === userID
-    );
-  }, [transactions, currentUser, isAdmin]);
+  const visibleTransactions = blockchainHistory;
 
   /*
    * =====================================================
@@ -1421,99 +1648,88 @@ useEffect(() => {
    * =====================================================
    */
 
-  const renderTransactions =
-    () => (
-      <>
-        <div className="page-toolbar">
-          <div>
-            <h2>
-              Lịch sử giao dịch
-            </h2>
-
-            <p>
-              Các thao tác thực hiện từ ứng dụng
-            </p>
-          </div>
+  const renderTransactions = () => (
+    <>
+      <div className="page-toolbar">
+        <div>
+          <h2>Lịch sử giao dịch</h2>
+          <p>
+            Lịch sử được truy xuất trực tiếp từ Blockchain thông qua GetAssetHistory
+          </p>
         </div>
 
+        <button
+          className="secondary-button"
+          onClick={loadBlockchainHistory}
+          disabled={historyLoading}
+        >
+          {historyLoading ? "Đang tải..." : "↻ Làm mới lịch sử"}
+        </button>
+      </div>
 
-        <div className="table-card">
-          <table>
-            <thead>
+      {historyError && (
+        <div className="notice">
+          ⚠ {historyError}
+        </div>
+      )}
+
+      <div className="table-card">
+        <table>
+          <thead>
+            <tr>
+              <th>TRANSACTION ID</th>
+              <th>THAO TÁC</th>
+              <th>TÀI SẢN</th>
+              <th>CHỦ SỞ HỮU</th>
+              <th>CHI TIẾT</th>
+              <th>THỜI GIAN</th>
+            </tr>
+          </thead>
+
+          <tbody>
+            {historyLoading ? (
               <tr>
-                <th>MÃ</th>
-                <th>THAO TÁC</th>
-                <th>TÀI SẢN</th>
-                <th>CHI TIẾT</th>
-                <th>THỜI GIAN</th>
+                <td colSpan="6" className="empty">
+                  ⏳ Đang truy xuất lịch sử từ Blockchain...
+                </td>
               </tr>
-            </thead>
-
-            <tbody>
-              {visibleTransactions.length ? (
-                visibleTransactions.map(
-                  (transaction) => (
-                    <tr
-                      key={
-                        transaction.id
-                      }
-                    >
-                      <td>
-                        {
-                          transaction.id
-                        }
-                      </td>
-
-                      <td>
-                        {
-                          transaction.action
-                        }
-                      </td>
-
-                      <td>
-                        {
-                          transaction.assetName
-                        }{" "}
-                        <small>
-                          (
-                          {
-                            transaction.assetID
-                          }
-                          )
-                        </small>
-                      </td>
-
-                      <td>
-                        {
-                          transaction.detail ||
-                          "-"
-                        }
-                      </td>
-
-                      <td>
-                        {
-                          transaction.time
-                        }
-                      </td>
-                    </tr>
-                  )
-                )
-              ) : (
-                <tr>
+            ) : visibleTransactions.length ? (
+              visibleTransactions.map((transaction, index) => (
+                <tr key={`${transaction.txId}-${index}`}>
                   <td
-                    colSpan="5"
-                    className="empty"
+                    title={transaction.txId || ""}
+                    style={{
+                      maxWidth: "190px",
+                      whiteSpace: "nowrap",
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                    }}
                   >
-                    Chưa có giao dịch nào
+                    <small>{shortenTxId(transaction.txId)}</small>
                   </td>
+                  <td>
+                    <strong>{transaction.action}</strong>
+                  </td>
+                  <td>
+                    {transaction.assetName} <small>({transaction.assetID})</small>
+                  </td>
+                  <td>{transaction.ownerID || "-"}</td>
+                  <td>{transaction.detail || "-"}</td>
+                  <td>{transaction.time}</td>
                 </tr>
-              )}
-            </tbody>
-          </table>
-        </div>
-      </>
-    );
-
+              ))
+            ) : (
+              <tr>
+                <td colSpan="6" className="empty">
+                  Chưa có lịch sử giao dịch trên Blockchain
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+    </>
+  );
 
   /*
    * =====================================================
@@ -1660,21 +1876,49 @@ useEffect(() => {
             </div>
           </div>
 
-          <h1 className="login-title" style={{ marginBottom: "8px" }}>Đăng nhập</h1>
+          <h1
+            className="login-title"
+            style={{
+              marginBottom: "8px",
+              textAlign: "center",
+              width: "100%",
+            }}
+          >
+            Đăng nhập
+          </h1>
           <p className="login-subtitle muted" style={{ marginBottom: "24px" }}>
             Đăng nhập bằng username được lưu trên Hyperledger Fabric
           </p>
 
-          <label>
-            Username
+          <div
+            style={{
+              width: "100%",
+              marginTop: "8px",
+            }}
+          >
             <input
               autoFocus
               required
               value={loginUsername}
               onChange={(event) => setLoginUsername(event.target.value)}
               placeholder="Nhập username"
+              aria-label="Username"
+              style={{
+                display: "block",
+                width: "100%",
+                height: "52px",
+                boxSizing: "border-box",
+                padding: "0 16px",
+                border: "1px solid #d1d5db",
+                borderRadius: "10px",
+                background: "#f9fafb",
+                color: "#111827",
+                fontSize: "16px",
+                outline: "none",
+                transition: "all .2s ease",
+              }}
             />
-          </label>
+          </div>
 
           <button
             className="primary-button"
@@ -1685,9 +1929,6 @@ useEffect(() => {
             {loginLoading ? "Đang kiểm tra Blockchain..." : "Đăng nhập"}
           </button>
 
-          <p className="muted" style={{ marginTop: "18px", fontSize: "13px", textAlign: "center" }}>
-            Demo: username được xác thực trực tiếp từ Blockchain.
-          </p>
         </form>
 
         <NoticeModal
@@ -1929,6 +2170,11 @@ useEffect(() => {
       </main>
 
 
+      <ConfirmModal
+        dialog={confirmDialog}
+        onClose={() => setConfirmDialog(null)}
+      />
+
       {modal === "asset" && (
         <AssetModal
           initial={editing}
@@ -2157,6 +2403,102 @@ useEffect(() => {
  * NOTIFICATION POPUP
  * =====================================================
  */
+
+function ConfirmModal({ dialog, onClose }) {
+  if (!dialog) return null;
+
+  const handleConfirm = async () => {
+    if (!dialog.onConfirm) {
+      onClose();
+      return;
+    }
+    await dialog.onConfirm();
+  };
+
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label={dialog.title}
+      onClick={onClose}
+      style={{
+        position: "fixed",
+        inset: 0,
+        zIndex: 100000,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        padding: "24px",
+        background: "rgba(0,0,0,.52)",
+        backdropFilter: "blur(3px)",
+      }}
+    >
+      <div
+        onClick={(event) => event.stopPropagation()}
+        style={{
+          width: "min(560px, 100%)",
+          background: "#fff",
+          borderRadius: "18px",
+          padding: "30px",
+          boxShadow: "0 25px 80px rgba(0,0,0,.28)",
+        }}
+      >
+        <div
+          style={{
+            width: "58px",
+            height: "58px",
+            borderRadius: "50%",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            marginBottom: "18px",
+            background: dialog.danger ? "#fee2e2" : "#dbeafe",
+            color: dialog.danger ? "#dc2626" : "#2563eb",
+            fontSize: "28px",
+            fontWeight: 700,
+          }}
+        >
+          {dialog.danger ? "!" : "?"}
+        </div>
+
+        <h2 style={{ margin: "0 0 14px" }}>{dialog.title}</h2>
+
+        <p
+          style={{
+            margin: 0,
+            whiteSpace: "pre-line",
+            lineHeight: 1.65,
+            color: "#64748b",
+          }}
+        >
+          {dialog.message}
+        </p>
+
+        <div
+          className="modal-actions"
+          style={{ marginTop: "28px" }}
+        >
+          <button
+            type="button"
+            className="secondary-button"
+            onClick={onClose}
+          >
+            Hủy
+          </button>
+
+          <button
+            type="button"
+            className={dialog.danger ? "danger-button" : "primary-button"}
+            onClick={handleConfirm}
+          >
+            {dialog.confirmText || "Xác nhận"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 
 function NoticeModal({ message, onClose }) {
   if (!message) return null;
