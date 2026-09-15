@@ -1,0 +1,6 @@
+Flask
+itsdangerous
+requests
+python-dotenv
+flask-cors
+Werkzeug

@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/hyperledger/fabric-contract-api-go/contractapi"
 )
@@ -20,6 +21,12 @@ type User struct {
 	Username string `json:"username"`
 	FullName string `json:"fullName"`
 	Role     string `json:"role"`
+}
+
+// UserCredential is stored separately so user-list queries never expose password hashes.
+type UserCredential struct {
+	Username     string `json:"username"`
+	PasswordHash string `json:"passwordHash"`
 }
 
 // ================================
@@ -59,7 +66,13 @@ func (s *SmartContract) CreateUser(
 	username string,
 	fullName string,
 	role string,
+	passwordHash string,
 ) error {
+	username = strings.TrimSpace(username)
+	passwordHash = strings.TrimSpace(passwordHash)
+	if username == "" || passwordHash == "" {
+		return fmt.Errorf("username and password hash are required")
+	}
 
 	exists, err := s.UserExists(ctx, id)
 	if err != nil {
@@ -68,6 +81,14 @@ func (s *SmartContract) CreateUser(
 
 	if exists {
 		return fmt.Errorf("user %s already exists", id)
+	}
+
+	usernameExists, err := s.UsernameExists(ctx, username)
+	if err != nil {
+		return err
+	}
+	if usernameExists {
+		return fmt.Errorf("username %s already exists", username)
 	}
 
 	user := User{
@@ -82,7 +103,126 @@ func (s *SmartContract) CreateUser(
 		return err
 	}
 
-	return ctx.GetStub().PutState("USER_"+id, data)
+	if err := ctx.GetStub().PutState("USER_"+id, data); err != nil {
+		return err
+	}
+
+	credential := UserCredential{Username: username, PasswordHash: passwordHash}
+	credentialData, err := json.Marshal(credential)
+	if err != nil {
+		return err
+	}
+
+	return ctx.GetStub().PutState("AUTH_"+strings.ToLower(username), credentialData)
+}
+
+// UsernameExists checks whether a login name already has credentials.
+func (s *SmartContract) UsernameExists(ctx contractapi.TransactionContextInterface, username string) (bool, error) {
+	normalizedUsername := strings.TrimSpace(username)
+	data, err := ctx.GetStub().GetState("AUTH_" + strings.ToLower(normalizedUsername))
+	if err != nil {
+		return false, err
+	}
+	if data != nil {
+		return true, nil
+	}
+
+	users, err := s.GetAllUsers(ctx)
+	if err != nil {
+		return false, err
+	}
+	for _, user := range users {
+		if strings.EqualFold(strings.TrimSpace(user.Username), normalizedUsername) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// GetUserByUsername returns the public user profile matching a login name.
+func (s *SmartContract) GetUserByUsername(ctx contractapi.TransactionContextInterface, username string) (*User, error) {
+	users, err := s.GetAllUsers(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, user := range users {
+		if strings.EqualFold(strings.TrimSpace(user.Username), strings.TrimSpace(username)) {
+			return user, nil
+		}
+	}
+	return nil, fmt.Errorf("username does not exist")
+}
+
+// GetPasswordHash returns the stored one-way hash for backend verification.
+func (s *SmartContract) GetPasswordHash(ctx contractapi.TransactionContextInterface, username string) (string, error) {
+	data, err := ctx.GetStub().GetState("AUTH_" + strings.ToLower(strings.TrimSpace(username)))
+	if err != nil {
+		return "", err
+	}
+	if data == nil {
+		return "", fmt.Errorf("credentials do not exist")
+	}
+
+	var credential UserCredential
+	if err := json.Unmarshal(data, &credential); err != nil {
+		return "", err
+	}
+	return credential.PasswordHash, nil
+}
+
+// SetUserPassword creates or replaces credentials for an existing user.
+func (s *SmartContract) SetUserPassword(ctx contractapi.TransactionContextInterface, userID string, passwordHash string) error {
+	user, err := s.GetUser(ctx, userID)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(passwordHash) == "" {
+		return fmt.Errorf("password hash is required")
+	}
+
+	credential := UserCredential{Username: user.Username, PasswordHash: strings.TrimSpace(passwordHash)}
+	data, err := json.Marshal(credential)
+	if err != nil {
+		return err
+	}
+	return ctx.GetStub().PutState("AUTH_"+strings.ToLower(strings.TrimSpace(user.Username)), data)
+}
+
+// DeleteUser removes a user and their credentials when no assets depend on them.
+func (s *SmartContract) DeleteUser(ctx contractapi.TransactionContextInterface, id string) error {
+	user, err := s.GetUser(ctx, id)
+	if err != nil {
+		return err
+	}
+
+	assets, err := s.GetAssetsByOwner(ctx, id)
+	if err != nil {
+		return err
+	}
+	if len(assets) > 0 {
+		return fmt.Errorf("user %s still owns %d asset(s)", id, len(assets))
+	}
+
+	if strings.EqualFold(user.Role, "admin") {
+		users, err := s.GetAllUsers(ctx)
+		if err != nil {
+			return err
+		}
+		adminCount := 0
+		for _, candidate := range users {
+			if strings.EqualFold(candidate.Role, "admin") {
+				adminCount++
+			}
+		}
+		if adminCount <= 1 {
+			return fmt.Errorf("cannot delete the last admin user")
+		}
+	}
+
+	if err := ctx.GetStub().DelState("AUTH_" + strings.ToLower(strings.TrimSpace(user.Username))); err != nil {
+		return err
+	}
+	return ctx.GetStub().DelState("USER_" + id)
 }
 
 // GetUser returns a user by ID.
@@ -491,10 +631,11 @@ func (s *SmartContract) GetAssetHistory(
 
 	return history, nil
 }
+
 // ================================
 // GET ALL USERS
 // ================================
-/// GetAllUsers returns all users.
+// GetAllUsers returns all users.
 func (s *SmartContract) GetAllUsers(
 	ctx contractapi.TransactionContextInterface,
 ) ([]*User, error) {
@@ -545,6 +686,7 @@ func (s *SmartContract) GetAllUsers(
 
 	return users, nil
 }
+
 // ================================
 // INIT LEDGER
 // ================================
@@ -593,4 +735,3 @@ func (s *SmartContract) InitLedger(
 
 	return nil
 }
-
