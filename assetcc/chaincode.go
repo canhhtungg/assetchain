@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/hyperledger/fabric-contract-api-go/contractapi"
 )
@@ -17,10 +18,13 @@ type SmartContract struct {
 // ================================
 
 type User struct {
-	ID       string `json:"id"`
-	Username string `json:"username"`
-	FullName string `json:"fullName"`
-	Role     string `json:"role"`
+	ID        string `json:"id"`
+	Username  string `json:"username"`
+	FullName  string `json:"fullName"`
+	Role      string `json:"role"`
+	Contact   string `json:"contact"`
+	CreatedBy string `json:"createdBy"`
+	CreatedAt string `json:"createdAt"`
 }
 
 // UserCredential is stored separately so user-list queries never expose password hashes.
@@ -39,9 +43,11 @@ type Asset struct {
 	Type         string `json:"type"`
 	OwnerID      string `json:"ownerID"`
 	Value        int    `json:"value"`
+	Quantity     int    `json:"quantity"`
 	Status       string `json:"status"`
 	SerialNumber string `json:"serialNumber"`
 	Description  string `json:"description"`
+	LastActorID  string `json:"lastActorID"`
 }
 
 // ================================
@@ -67,6 +73,8 @@ func (s *SmartContract) CreateUser(
 	fullName string,
 	role string,
 	passwordHash string,
+	contact string,
+	createdBy string,
 ) error {
 	username = strings.TrimSpace(username)
 	passwordHash = strings.TrimSpace(passwordHash)
@@ -91,11 +99,18 @@ func (s *SmartContract) CreateUser(
 		return fmt.Errorf("username %s already exists", username)
 	}
 
+	createdAt := ""
+	if timestamp, timestampErr := ctx.GetStub().GetTxTimestamp(); timestampErr == nil && timestamp != nil {
+		createdAt = timestamp.AsTime().UTC().Format(time.RFC3339)
+	}
 	user := User{
-		ID:       id,
-		Username: username,
-		FullName: fullName,
-		Role:     role,
+		ID:        id,
+		Username:  username,
+		FullName:  fullName,
+		Role:      role,
+		Contact:   strings.TrimSpace(contact),
+		CreatedBy: strings.TrimSpace(createdBy),
+		CreatedAt: createdAt,
 	}
 
 	data, err := json.Marshal(user)
@@ -114,6 +129,46 @@ func (s *SmartContract) CreateUser(
 	}
 
 	return ctx.GetStub().PutState("AUTH_"+strings.ToLower(username), credentialData)
+}
+
+// UpdateUser changes public profile fields while preserving credentials and provenance.
+func (s *SmartContract) UpdateUser(
+	ctx contractapi.TransactionContextInterface,
+	id string,
+	fullName string,
+	role string,
+	contact string,
+) error {
+	user, err := s.GetUser(ctx, id)
+	if err != nil {
+		return err
+	}
+	user.FullName = strings.TrimSpace(fullName)
+	user.Role = strings.TrimSpace(role)
+	user.Contact = strings.TrimSpace(contact)
+	data, err := json.Marshal(user)
+	if err != nil {
+		return err
+	}
+	return ctx.GetStub().PutState("USER_"+id, data)
+}
+
+// EnsureStoreUser creates the non-login owner used for store inventory and buybacks.
+func (s *SmartContract) EnsureStoreUser(ctx contractapi.TransactionContextInterface) error {
+	exists, err := s.UserExists(ctx, "STORE")
+	if err != nil {
+		return err
+	}
+	if exists {
+		return nil
+	}
+	data, err := json.Marshal(User{
+		ID: "STORE", Username: "store", FullName: "Kho cửa hàng", Role: "STORE",
+	})
+	if err != nil {
+		return err
+	}
+	return ctx.GetStub().PutState("USER_STORE", data)
 }
 
 // UsernameExists checks whether a login name already has credentials.
@@ -279,7 +334,17 @@ func (s *SmartContract) CreateAsset(
 	status string,
 	serialNumber string,
 	description string,
+	quantity int,
+	actorID string,
 ) error {
+	if quantity < 1 {
+		return fmt.Errorf("quantity must be at least 1")
+	}
+	if ownerID == "STORE" {
+		if err := s.EnsureStoreUser(ctx); err != nil {
+			return err
+		}
+	}
 
 	exists, err := s.AssetExists(ctx, id)
 	if err != nil {
@@ -306,9 +371,11 @@ func (s *SmartContract) CreateAsset(
 		Type:         assetType,
 		OwnerID:      ownerID,
 		Value:        value,
+		Quantity:     quantity,
 		Status:       status,
 		SerialNumber: serialNumber,
 		Description:  description,
+		LastActorID:  strings.TrimSpace(actorID),
 	}
 
 	data, err := json.Marshal(asset)
@@ -340,6 +407,9 @@ func (s *SmartContract) ReadAsset(
 	if err != nil {
 		return nil, err
 	}
+	if asset.Quantity < 1 {
+		asset.Quantity = 1
+	}
 
 	return &asset, nil
 }
@@ -355,7 +425,17 @@ func (s *SmartContract) UpdateAsset(
 	status string,
 	serialNumber string,
 	description string,
+	quantity int,
+	actorID string,
 ) error {
+	if quantity < 1 {
+		return fmt.Errorf("quantity must be at least 1")
+	}
+	if ownerID == "STORE" {
+		if err := s.EnsureStoreUser(ctx); err != nil {
+			return err
+		}
+	}
 
 	exists, err := s.AssetExists(ctx, id)
 	if err != nil {
@@ -381,9 +461,11 @@ func (s *SmartContract) UpdateAsset(
 		Type:         assetType,
 		OwnerID:      ownerID,
 		Value:        value,
+		Quantity:     quantity,
 		Status:       status,
 		SerialNumber: serialNumber,
 		Description:  description,
+		LastActorID:  strings.TrimSpace(actorID),
 	}
 
 	data, err := json.Marshal(asset)
@@ -412,6 +494,32 @@ func (s *SmartContract) DeleteAsset(
 	return ctx.GetStub().DelState(id)
 }
 
+// DeleteAssetQuantity removes all or part of an asset quantity.
+func (s *SmartContract) DeleteAssetQuantity(
+	ctx contractapi.TransactionContextInterface,
+	id string,
+	quantity int,
+	actorID string,
+) error {
+	asset, err := s.ReadAsset(ctx, id)
+	if err != nil {
+		return err
+	}
+	if quantity < 1 || quantity > asset.Quantity {
+		return fmt.Errorf("quantity must be between 1 and %d", asset.Quantity)
+	}
+	if quantity == asset.Quantity {
+		return ctx.GetStub().DelState(id)
+	}
+	asset.Quantity -= quantity
+	asset.LastActorID = strings.TrimSpace(actorID)
+	data, err := json.Marshal(asset)
+	if err != nil {
+		return err
+	}
+	return ctx.GetStub().PutState(id, data)
+}
+
 // AssetExists checks whether an asset exists.
 func (s *SmartContract) AssetExists(
 	ctx contractapi.TransactionContextInterface,
@@ -435,7 +543,13 @@ func (s *SmartContract) TransferAsset(
 	ctx contractapi.TransactionContextInterface,
 	id string,
 	newOwnerID string,
+	actorID string,
 ) error {
+	if newOwnerID == "STORE" {
+		if err := s.EnsureStoreUser(ctx); err != nil {
+			return err
+		}
+	}
 
 	asset, err := s.ReadAsset(ctx, id)
 	if err != nil {
@@ -452,6 +566,7 @@ func (s *SmartContract) TransferAsset(
 	}
 
 	asset.OwnerID = newOwnerID
+	asset.LastActorID = strings.TrimSpace(actorID)
 
 	data, err := json.Marshal(asset)
 	if err != nil {
@@ -459,6 +574,99 @@ func (s *SmartContract) TransferAsset(
 	}
 
 	return ctx.GetStub().PutState(id, data)
+}
+
+// ReturnAssetToStore transfers a customer asset back into store inventory.
+func (s *SmartContract) ReturnAssetToStore(ctx contractapi.TransactionContextInterface, id string, actorID string) error {
+	asset, err := s.ReadAsset(ctx, id)
+	if err != nil {
+		return err
+	}
+	if err := s.EnsureStoreUser(ctx); err != nil {
+		return err
+	}
+	asset.OwnerID = "STORE"
+	asset.Status = "Active"
+	asset.LastActorID = strings.TrimSpace(actorID)
+	data, err := json.Marshal(asset)
+	if err != nil {
+		return err
+	}
+	return ctx.GetStub().PutState(id, data)
+}
+
+// TransferAssetQuantity transfers all or part of a store inventory record.
+func (s *SmartContract) TransferAssetQuantity(
+	ctx contractapi.TransactionContextInterface,
+	id string,
+	newOwnerID string,
+	quantity int,
+	newAssetID string,
+	actorID string,
+) error {
+	if newOwnerID == "STORE" {
+		if err := s.EnsureStoreUser(ctx); err != nil {
+			return err
+		}
+	}
+	asset, err := s.ReadAsset(ctx, id)
+	if err != nil {
+		return err
+	}
+	if quantity < 1 || quantity > asset.Quantity {
+		return fmt.Errorf("quantity must be between 1 and %d", asset.Quantity)
+	}
+	ownerExists, err := s.UserExists(ctx, newOwnerID)
+	if err != nil {
+		return err
+	}
+	if !ownerExists {
+		return fmt.Errorf("new owner %s does not exist", newOwnerID)
+	}
+
+	if quantity == asset.Quantity {
+		asset.OwnerID = newOwnerID
+		asset.LastActorID = strings.TrimSpace(actorID)
+		data, err := json.Marshal(asset)
+		if err != nil {
+			return err
+		}
+		return ctx.GetStub().PutState(id, data)
+	}
+
+	newAssetID = strings.TrimSpace(newAssetID)
+	if newAssetID == "" {
+		return fmt.Errorf("new asset ID is required for a partial transfer")
+	}
+	exists, err := s.AssetExists(ctx, newAssetID)
+	if err != nil {
+		return err
+	}
+	if exists {
+		return fmt.Errorf("asset %s already exists", newAssetID)
+	}
+
+	soldAsset := *asset
+	soldAsset.ID = newAssetID
+	soldAsset.OwnerID = newOwnerID
+	soldAsset.Quantity = quantity
+	soldAsset.Status = "Sold"
+	soldAsset.LastActorID = strings.TrimSpace(actorID)
+	asset.Quantity -= quantity
+	asset.LastActorID = strings.TrimSpace(actorID)
+
+	remainingData, err := json.Marshal(asset)
+	if err != nil {
+		return err
+	}
+	soldData, err := json.Marshal(soldAsset)
+	if err != nil {
+		return err
+	}
+	if err := ctx.GetStub().PutState(id, remainingData); err != nil {
+		return err
+	}
+	return ctx.GetStub().PutState(newAssetID, soldData)
 }
 
 // ================================
@@ -507,6 +715,9 @@ func (s *SmartContract) GetAssetsByOwner(
 		// Bỏ qua dữ liệu không phải Asset
 		if asset.ID == "" {
 			continue
+		}
+		if asset.Quantity < 1 {
+			asset.Quantity = 1
 		}
 
 		if asset.OwnerID == ownerID {
@@ -566,6 +777,9 @@ func (s *SmartContract) GetAllAssets(
 		// Chỉ nhận dữ liệu thực sự là Asset
 		if asset.ID == "" {
 			continue
+		}
+		if asset.Quantity < 1 {
+			asset.Quantity = 1
 		}
 
 		assets = append(
@@ -706,13 +920,13 @@ func (s *SmartContract) InitLedger(
 			ID:       "U002",
 			Username: "canhtung",
 			FullName: "Canh Tung",
-			Role:     "USER",
+			Role:     "CUSTOMER",
 		},
 		{
 			ID:       "U003",
 			Username: "nguyenvana",
 			FullName: "Nguyen Van A",
-			Role:     "USER",
+			Role:     "CUSTOMER",
 		},
 	}
 
