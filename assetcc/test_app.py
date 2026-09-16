@@ -20,6 +20,7 @@ class AuthenticationApiTest(unittest.TestCase):
         backend.ROLE_PERMISSIONS_FILE = os.path.join(
             self.permissions_directory.name, "permissions.json"
         )
+        backend.login_failures.clear()
         backend.app.config.update(TESTING=True)
         self.client = backend.app.test_client()
 
@@ -27,6 +28,7 @@ class AuthenticationApiTest(unittest.TestCase):
         backend.APP_SECRET = self.previous_secret
         backend.AUTH_CREDENTIALS_FILE = self.previous_credentials_file
         backend.ROLE_PERMISSIONS_FILE = self.previous_permissions_file
+        backend.login_failures.clear()
         self.permissions_directory.cleanup()
 
     def test_login_requires_username_and_password(self):
@@ -89,6 +91,25 @@ class AuthenticationApiTest(unittest.TestCase):
         self.assertEqual(response.status_code, 401)
         self.assertEqual(response.get_json()["message"], "Username hoặc password không đúng")
         self.assertEqual(invoke.call_count, 1)
+
+    @patch("app.invoke_chaincode")
+    def test_login_rate_limits_repeated_failures(self, invoke):
+        invoke.return_value = {
+            "success": True,
+            "data": {"result": generate_password_hash("correct-password")},
+        }
+        for _ in range(backend.LOGIN_FAILURE_LIMIT):
+            response = self.client.post(
+                "/api/auth/login",
+                json={"username": "rate-limited-user", "password": "wrong-password"},
+            )
+            self.assertEqual(response.status_code, 401)
+        blocked = self.client.post(
+            "/api/auth/login",
+            json={"username": "rate-limited-user", "password": "wrong-password"},
+        )
+        self.assertEqual(blocked.status_code, 429)
+        self.assertEqual(invoke.call_count, backend.LOGIN_FAILURE_LIMIT)
 
     @patch("app.invoke_chaincode")
     def test_legacy_user_can_use_hashed_credentials_file(self, invoke):

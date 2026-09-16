@@ -2,8 +2,11 @@ import os
 import json
 import requests
 from datetime import datetime, timezone
+from collections import defaultdict, deque
 from functools import wraps
 from pathlib import Path
+from threading import Lock
+from time import monotonic
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -20,14 +23,15 @@ load_dotenv()
 
 app = Flask(__name__)
 
-CORS(
-    app,
-    resources={
-        r"/api/*": {
-            "origins": "*"
-        }
-    }
-)
+ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv(
+        "CORS_ORIGINS",
+        "http://127.0.0.1:5173,http://localhost:5173,https://canhhtungg.github.io",
+    ).split(",")
+    if origin.strip()
+]
+CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGINS}})
 
 
 # ==========================================
@@ -73,6 +77,10 @@ ALL_PERMISSIONS = [
 ]
 STORE_USER_ID = "STORE"
 ADMIN_OWNER_ID = os.getenv("ADMIN_OWNER_ID", "U001")
+LOGIN_FAILURE_LIMIT = int(os.getenv("LOGIN_FAILURE_LIMIT", "8"))
+LOGIN_FAILURE_WINDOW = int(os.getenv("LOGIN_FAILURE_WINDOW", "600"))
+login_failures = defaultdict(deque)
+login_failures_lock = Lock()
 
 FABRIC_CHAINCODE_ID = os.getenv(
     "FABRIC_CHAINCODE_ID",
@@ -255,6 +263,34 @@ def auth_serializer():
     return URLSafeTimedSerializer(APP_SECRET, salt="assetchain-auth")
 
 
+def login_attempt_key(username):
+    forwarded_for = request.headers.get("X-Forwarded-For", "").split(",", 1)[0].strip()
+    client_address = forwarded_for or request.remote_addr or "unknown"
+    return f"{client_address}:{username.strip().lower()}"
+
+
+def login_is_rate_limited(key):
+    now = monotonic()
+    cutoff = now - LOGIN_FAILURE_WINDOW
+    with login_failures_lock:
+        failures = login_failures[key]
+        while failures and failures[0] < cutoff:
+            failures.popleft()
+        return len(failures) >= LOGIN_FAILURE_LIMIT
+
+
+def record_login_failure(key):
+    with login_failures_lock:
+        if len(login_failures) > 5000:
+            login_failures.clear()
+        login_failures[key].append(monotonic())
+
+
+def clear_login_failures(key):
+    with login_failures_lock:
+        login_failures.pop(key, None)
+
+
 def configured_password_hash(username):
     if not AUTH_CREDENTIALS_FILE:
         return None
@@ -425,6 +461,13 @@ def login():
             "message": "Username và password là bắt buộc"
         }), 400
 
+    attempt_key = login_attempt_key(username)
+    if login_is_rate_limited(attempt_key):
+        return jsonify({
+            "status": "error",
+            "message": "Đăng nhập tạm thời bị giới hạn. Vui lòng thử lại sau"
+        }), 429
+
     credential_result = invoke_chaincode("GetPasswordHash", [username])
     password_hash = parse_chaincode_result(credential_result)
     if not credential_result.get("success") or not isinstance(password_hash, str):
@@ -433,6 +476,7 @@ def login():
         not isinstance(password_hash, str)
         or not check_password_hash(password_hash, password)
     ):
+        record_login_failure(attempt_key)
         return jsonify({
             "status": "error",
             "message": "Username hoặc password không đúng"
@@ -454,11 +498,13 @@ def login():
                 None,
             )
     if not isinstance(user, dict):
+        record_login_failure(attempt_key)
         return jsonify({
             "status": "error",
             "message": "Username hoặc password không đúng"
         }), 401
 
+    clear_login_failures(attempt_key)
     user["role"] = normalize_role(user.get("role")).upper()
 
     try:
@@ -1249,7 +1295,7 @@ def fabric_networks():
 if __name__ == "__main__":
 
     app.run(
-        host="0.0.0.0",
+        host=os.getenv("BACKEND_HOST", "127.0.0.1"),
         port=5000,
         debug=os.getenv("FLASK_DEBUG", "0") == "1"
     )
