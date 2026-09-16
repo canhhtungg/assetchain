@@ -318,6 +318,33 @@ class AuthenticationApiTest(unittest.TestCase):
         self.assertEqual(create_args[6], "U001")
 
     @patch("app.invoke_chaincode")
+    def test_sales_create_customer_response_hides_private_fields(self, invoke):
+        invoke.side_effect = [
+            {
+                "success": True,
+                "data": {"result": [{"id": "S001"}, {"id": "C001"}]},
+            },
+            {"success": True, "data": {"result": {}}},
+        ]
+        token = backend.auth_serializer().dumps({"id": "S001", "role": "SALES"})
+        response = self.client.post(
+            "/api/users",
+            json={
+                "username": "hidden-login",
+                "password": "password-123",
+                "fullName": "New Customer",
+                "role": "customer",
+                "contact": "hidden@example.com",
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.get_json()["data"],
+            {"id": "user_3", "fullName": "New Customer", "role": "CUSTOMER"},
+        )
+
+    @patch("app.invoke_chaincode")
     def test_customer_can_only_update_own_contact(self, invoke):
         token = backend.auth_serializer().dumps(dict(id="C001", role="CUSTOMER"))
         invoke.side_effect = [
@@ -344,17 +371,103 @@ class AuthenticationApiTest(unittest.TestCase):
             "UpdateUser", ["C001", "Customer", "CUSTOMER", "new@example.com"]
         )
 
-    def test_sales_cannot_view_customer_after_ten_minutes(self):
+    def test_sales_can_view_created_customer_without_private_fields(self):
         user = {
             "id": "C001",
+            "username": "private-login",
             "fullName": "Old Customer",
             "role": "CUSTOMER",
+            "contact": "private@example.com",
             "createdBy": "S001",
             "createdAt": "2026-09-15T00:00:00Z",
+        }
+        visible = backend.public_user_for_identity(
+            {"id": "S001", "role": "SALES"}, user
+        )
+        self.assertEqual(
+            visible,
+            {"id": "C001", "fullName": "Old Customer", "role": "CUSTOMER"},
+        )
+
+    def test_sales_cannot_view_unrelated_customer(self):
+        user = {
+            "id": "C001",
+            "fullName": "Other Customer",
+            "role": "CUSTOMER",
+            "createdBy": "S002",
         }
         self.assertIsNone(
             backend.public_user_for_identity({"id": "S001", "role": "SALES"}, user)
         )
+
+    @patch("app.invoke_chaincode")
+    def test_sales_can_view_customer_they_sold_to_without_private_fields(self, invoke):
+        invoke.side_effect = [
+            {
+                "success": True,
+                "data": {
+                    "result": [
+                        {
+                            "id": "C001",
+                            "username": "hidden-login",
+                            "fullName": "Sold Customer",
+                            "role": "CUSTOMER",
+                            "contact": "hidden@example.com",
+                            "createdBy": "S002",
+                        },
+                        {
+                            "id": "C002",
+                            "fullName": "Unrelated Customer",
+                            "role": "CUSTOMER",
+                            "createdBy": "S002",
+                        },
+                    ]
+                },
+            },
+            {
+                "success": True,
+                "data": {
+                    "result": [
+                        {
+                            "id": "SALE-1",
+                            "ownerID": "C001",
+                            "lastActorID": "S001",
+                        }
+                    ]
+                },
+            },
+        ]
+        token = backend.auth_serializer().dumps({"id": "S001", "role": "SALES"})
+        response = self.client.get(
+            "/api/users", headers={"Authorization": f"Bearer {token}"}
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.get_json()["data"],
+            [{"id": "C001", "fullName": "Sold Customer", "role": "CUSTOMER"}],
+        )
+
+    @patch("app.invoke_chaincode")
+    def test_sales_cannot_update_customer(self, invoke):
+        invoke.return_value = {
+            "success": True,
+            "data": {
+                "result": {
+                    "id": "C001",
+                    "fullName": "Customer",
+                    "role": "CUSTOMER",
+                    "createdBy": "S001",
+                }
+            },
+        }
+        token = backend.auth_serializer().dumps({"id": "S001", "role": "SALES"})
+        response = self.client.put(
+            "/api/users/C001",
+            json={"fullName": "Changed"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(invoke.call_count, 1)
 
 
 if __name__ == "__main__":

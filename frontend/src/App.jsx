@@ -1800,28 +1800,32 @@ useEffect(() => {
                         user.id}
                     </strong>
 
-                    <span>
-                      ID: {user.id}
-                    </span>
+                    {!isSales && (
+                      <span>
+                        ID: {user.id}
+                      </span>
+                    )}
 
-                    {user.username && <span>Username: {user.username}</span>}
+                    {!isSales && user.username && <span>Username: {user.username}</span>}
 
-                    {user.contact && <span>SĐT/email: {user.contact}</span>}
+                    {!isSales && user.contact && <span>SĐT/email: {user.contact}</span>}
 
                     <span>
                       Vai trò: {ROLE_LABELS[normalizeRole(user.role)] || user.role}
                     </span>
 
-                    <span>
-                      {
-                        assets.filter(
-                          (asset) =>
-                            asset.ownerID ===
-                            user.id
-                        ).length
-                      }{" "}
-                      tài sản
-                    </span>
+                    {!isSales && (
+                      <span>
+                        {
+                          assets.filter(
+                            (asset) =>
+                              asset.ownerID ===
+                              user.id
+                          ).length
+                        }{" "}
+                        tài sản
+                      </span>
+                    )}
 
                     {user.canEdit && (
                       <button
@@ -3978,7 +3982,9 @@ function TransferModal({
                 <option value="">-- Chọn người nhận --</option>
                 {availableUsers.map((user) => (
                   <option key={user.id} value={user.id}>
-                    {user.fullName || user.username || user.id} ({user.id})
+                    {isSales
+                      ? `${user.fullName || "Khách hàng"} (${ROLE_LABELS[normalizeRole(user.role)] || user.role})`
+                      : `${user.fullName || user.username || user.id} (${user.id})`}
                   </option>
                 ))}
               </select>

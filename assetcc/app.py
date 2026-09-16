@@ -1,7 +1,6 @@
 import os
 import json
 import requests
-from datetime import datetime, timezone
 from collections import defaultdict, deque
 from functools import wraps
 from pathlib import Path
@@ -366,35 +365,39 @@ def can_view_asset(identity, asset):
     return False
 
 
-def created_within_minutes(user, creator_id, minutes=10):
-    if str(user.get("createdBy")) != str(creator_id):
-        return False
-    try:
-        created_at = datetime.fromisoformat(str(user.get("createdAt", "")).replace("Z", "+00:00"))
-        if created_at.tzinfo is None:
-            created_at = created_at.replace(tzinfo=timezone.utc)
-        age = datetime.now(timezone.utc) - created_at.astimezone(timezone.utc)
-        return 0 <= age.total_seconds() <= minutes * 60
-    except (TypeError, ValueError):
-        return False
+def customer_ids_sold_by(identity):
+    if normalize_role(identity.get("role")) != "sales":
+        return set()
+    result = invoke_chaincode("GetAllAssets", [])
+    assets = parse_chaincode_result(result)
+    if not result.get("success") or not isinstance(assets, list):
+        return set()
+    actor_id = str(identity.get("id"))
+    return {
+        str(asset.get("ownerID"))
+        for asset in assets
+        if str(asset.get("lastActorID")) == actor_id
+        and str(asset.get("ownerID")) not in {"", STORE_USER_ID, ADMIN_OWNER_ID}
+    }
 
 
-def public_user_for_identity(identity, user):
+def public_user_for_identity(identity, user, sold_customer_ids=None):
     role = normalize_role(identity.get("role"))
     target_role = normalize_role(user.get("role"))
     result = dict(user)
     if role == "sales":
+        is_own_customer = str(user.get("createdBy")) == str(identity.get("id"))
+        is_sold_customer = str(user.get("id")) in (sold_customer_ids or set())
         if (
             not has_permission(identity, "view_customers")
             or target_role != "customer"
-            or not created_within_minutes(user, identity.get("id"))
+            or not (is_own_customer or is_sold_customer)
         ):
             return None
         return {
             "id": user.get("id"),
             "fullName": user.get("fullName"),
             "role": "CUSTOMER",
-            "canEdit": True,
         }
     if role == "manager":
         if not has_permission(identity, "view_users") or target_role in {"admin", "store"}:
@@ -1040,11 +1043,14 @@ def get_users():
     users = parse_chaincode_result(result)
     if not isinstance(users, list):
         users = []
+    sold_customer_ids = customer_ids_sold_by(request.auth_user)
     visible = []
     for user in users:
         if normalize_role(user.get("role")) == "store":
             continue
-        public_user = public_user_for_identity(request.auth_user, user)
+        public_user = public_user_for_identity(
+            request.auth_user, user, sold_customer_ids
+        )
         if public_user:
             visible.append(public_user)
     return jsonify({"status": "success", "data": visible})
@@ -1069,7 +1075,9 @@ def get_user(user_id):
     user = parse_chaincode_result(result)
     if not isinstance(user, dict):
         return jsonify({"status": "error", "message": "Người dùng không tồn tại"}), 404
-    user = public_user_for_identity(request.auth_user, user)
+    user = public_user_for_identity(
+        request.auth_user, user, customer_ids_sold_by(request.auth_user)
+    )
     if not user:
         return jsonify({"status": "error", "message": "Không có quyền xem người dùng này"}), 403
 
@@ -1160,17 +1168,25 @@ def create_user():
             "fabric_response": result
         }), 500
 
+    created_user = {
+        "id": user_id,
+        "username": str(body["username"]),
+        "fullName": str(body["fullName"]),
+        "role": requested_role.upper(),
+        "contact": contact,
+        "createdBy": str(request.auth_user.get("id", "")),
+    }
+    response_user = public_user_for_identity(request.auth_user, created_user)
+    if creator_role == "sales":
+        response_user = {
+            "id": user_id,
+            "fullName": str(body["fullName"]),
+            "role": "CUSTOMER",
+        }
     return jsonify({
         "status": "success",
         "message": "Tạo người dùng thành công",
-        "data": {
-            "id": user_id,
-            "username": str(body["username"]),
-            "fullName": str(body["fullName"]),
-            "role": requested_role.upper(),
-            "contact": contact,
-            "createdBy": str(request.auth_user.get("id", "")),
-        },
+        "data": response_user or created_user,
         "fabric_response": result["data"]
     })
 
@@ -1192,11 +1208,7 @@ def update_user(user_id):
     elif actor_role == "manager":
         allowed = has_permission(request.auth_user, "update_user") and target_role not in {"admin", "store"}
     elif actor_role == "sales":
-        allowed = (
-            has_permission(request.auth_user, "create_customer")
-            and target_role == "customer"
-            and created_within_minutes(user, request.auth_user.get("id"))
-        )
+        allowed = False
     else:
         allowed = is_self and has_permission(request.auth_user, "update_own_contact")
     if not allowed:
