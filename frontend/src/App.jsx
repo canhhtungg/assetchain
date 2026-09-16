@@ -4,24 +4,39 @@ import "./App.css";
 const API_URL =
   import.meta.env.VITE_API_URL ||
   "http://127.0.0.1:5000";
+const ADMIN_OWNER_ID = "U001";
 
-const CHAINLAUNCH_URL =
-  import.meta.env.VITE_CHAINLAUNCH_URL ||
-  "http://127.0.0.1:8100/api/v1";
+const ROLE_LABELS = {
+  admin: "Admin",
+  manager: "Quản lý",
+  sales: "Nhân viên bán hàng",
+  warehouse: "Nhân viên kho",
+  customer: "Khách hàng",
+};
 
-const CHAINCODE_ID =
-  import.meta.env.VITE_CHAINCODE_ID || "1";
+const PERMISSION_LABELS = {
+  view_all_assets: "Xem toàn bộ tài sản",
+  view_inventory: "Xem hàng trong kho",
+  view_own_assets: "Xem tài sản cá nhân",
+  view_users: "Xem nhân viên và khách hàng",
+  view_customers: "Xem khách hàng",
+  create_staff: "Thêm nhân viên",
+  create_customer: "Thêm khách hàng",
+  create_asset: "Thêm sản phẩm/tài sản",
+  update_asset: "Cập nhật tài sản",
+  delete_asset: "Xóa mọi tài sản",
+  delete_own_asset: "Xóa tài sản cá nhân",
+  transfer_asset: "Bán/chuyển quyền tài sản",
+  sell_back: "Bán lại cho cửa hàng",
+  view_history: "Xem lịch sử giao dịch",
+  update_user: "Sửa thông tin nhân viên và khách hàng",
+  update_own_contact: "Sửa SĐT/email của chính mình",
+};
 
-const KEY_ID =
-  import.meta.env.VITE_KEY_ID || "6";
-
-const CHAINLAUNCH_USER =
-  import.meta.env.VITE_CHAINLAUNCH_USER || "admin";
-
-const CHAINLAUNCH_PASSWORD =
-  import.meta.env.VITE_CHAINLAUNCH_PASSWORD ||
-  "1d45cc8f4f5a9cfa1e2a0575";
-
+const normalizeRole = (role) => {
+  const normalized = String(role || "").toLowerCase();
+  return normalized === "user" ? "customer" : normalized;
+};
 
 const iconFor = (type) =>
   (
@@ -309,14 +324,28 @@ function App() {
 
   const [currentUser, setCurrentUser] = useState(() => {
     try {
-      return JSON.parse(localStorage.getItem("assetchain-session")) || null;
+      return JSON.parse(localStorage.getItem("assetchain-session"))?.user || null;
     } catch {
       return null;
     }
   });
 
+  const [authToken, setAuthToken] = useState(() => {
+    try {
+      return JSON.parse(localStorage.getItem("assetchain-session"))?.token || "";
+    } catch {
+      return "";
+    }
+  });
+
   const [loginUsername, setLoginUsername] = useState("");
+  const [loginPassword, setLoginPassword] = useState("");
   const [loginLoading, setLoginLoading] = useState(false);
+  const [permissions, setPermissions] = useState([]);
+  const [permissionConfig, setPermissionConfig] = useState(null);
+  const [userTab, setUserTab] = useState("employees");
+  const [editingUser, setEditingUser] = useState(null);
+  const [transactionQuery, setTransactionQuery] = useState("");
 
   const [themeMode, setThemeMode] = useState(() => {
     try {
@@ -338,8 +367,13 @@ function App() {
   const effectiveTheme =
     themeMode === "system" ? systemTheme : themeMode;
 
-  const isAdmin = currentUser?.role?.toLowerCase() === "admin";
-  const isUser = currentUser?.role?.toLowerCase() === "user";
+  const currentRole = normalizeRole(currentUser?.role);
+  const isAdmin = currentRole === "admin";
+  const isManager = currentRole === "manager";
+  const isSales = currentRole === "sales";
+  const isWarehouse = currentRole === "warehouse";
+  const isCustomer = currentRole === "customer";
+  const can = (permission) => isAdmin || permissions.includes(permission);
 
   useEffect(() => {
     try {
@@ -388,14 +422,8 @@ useEffect(() => {
     functionName,
     args = []
   ) => {
-    const auth =
-      "Basic " +
-      btoa(
-        `${CHAINLAUNCH_USER}:${CHAINLAUNCH_PASSWORD}`
-      );
-
     const response = await fetch(
-      `${CHAINLAUNCH_URL}/sc/fabric/chaincodes/${CHAINCODE_ID}/invoke`,
+      `${API_URL}/api/chaincode/invoke`,
       {
         method: "POST",
 
@@ -403,12 +431,10 @@ useEffect(() => {
           "Content-Type":
             "application/json",
 
-          Authorization: auth,
+          Authorization: `Bearer ${authToken}`,
         },
 
         body: JSON.stringify({
-          key_id: String(KEY_ID),
-
           function: functionName,
 
           args: args.map((arg) =>
@@ -449,6 +475,22 @@ useEffect(() => {
     return data;
   };
 
+  const apiRequest = async (path, options = {}) => {
+    const response = await fetch(`${API_URL}${path}`, {
+      ...options,
+      headers: {
+        ...(options.body ? { "Content-Type": "application/json" } : {}),
+        Authorization: "Bearer " + authToken,
+        ...(options.headers || {}),
+      },
+    });
+    const data = await response.json();
+    if (!response.ok) {
+      throw new Error(data.message || "Yêu cầu không thành công");
+    }
+    return data;
+  };
+
 
   /*
    * =====================================================
@@ -458,22 +500,8 @@ useEffect(() => {
 
   const loadAssets = async () => {
     try {
-      const data =
-        await invokeChaincode(
-          "GetAllAssets",
-          []
-        );
-
-      const result =
-        parseChaincodeResult(
-          data,
-          []
-        );
-
-      const blockchainAssets =
-        Array.isArray(result)
-          ? result
-          : [];
+      const data = await apiRequest("/api/assets");
+      const blockchainAssets = Array.isArray(data.data) ? data.data : [];
 
 
       const formattedAssets =
@@ -484,6 +512,8 @@ useEffect(() => {
             value: Number(
               asset.value || 0
             ),
+
+            quantity: Number(asset.quantity || 1),
 
             updatedAt:
               asset.updatedAt ||
@@ -522,22 +552,8 @@ useEffect(() => {
 
   const loadUsers = async () => {
     try {
-      const data =
-        await invokeChaincode(
-          "GetAllUsers",
-          []
-        );
-
-      const result =
-        parseChaincodeResult(
-          data,
-          []
-        );
-
-      const blockchainUsers =
-        Array.isArray(result)
-          ? result
-          : [];
+      const data = await apiRequest("/api/users");
+      const blockchainUsers = Array.isArray(data.data) ? data.data : [];
 
       setUsers(
         blockchainUsers
@@ -554,6 +570,15 @@ useEffect(() => {
     }
   };
 
+  const loadPermissions = async () => {
+    const data = await apiRequest("/api/permissions/me");
+    setPermissions(data.data?.permissions || []);
+    if (normalizeRole(currentUser?.role) === "admin") {
+      const config = await apiRequest("/api/permissions");
+      setPermissionConfig(config.data);
+    }
+  };
+
 
   /*
    * =====================================================
@@ -565,7 +590,8 @@ useEffect(() => {
     try {
       const response =
         await fetch(
-          `${API_URL}/api/fabric/networks`
+          `${API_URL}/api/fabric/networks`,
+          { headers: { Authorization: `Bearer ${authToken}` } }
         );
 
       const data =
@@ -599,6 +625,7 @@ useEffect(() => {
         loadAssets(),
         loadUsers(),
         loadNetworks(),
+        loadPermissions(),
       ]);
     } catch (error) {
       console.error(error);
@@ -625,9 +652,15 @@ useEffect(() => {
    */
 
   const visibleAssets = useMemo(() => {
-    if (isAdmin) return assets;
+    if (
+      isAdmin ||
+      permissions.includes("view_all_assets") ||
+      permissions.includes("view_inventory")
+    ) {
+      return assets;
+    }
     return assets.filter((asset) => asset.ownerID === currentUser?.id);
-  }, [assets, currentUser, isAdmin]);
+  }, [assets, currentUser, isAdmin, permissions]);
 
   const filteredAssets = useMemo(() => {
     return visibleAssets.filter((asset) =>
@@ -681,6 +714,27 @@ useEffect(() => {
           ?.toLowerCase() ===
         "active"
     ).length;
+
+  const inventoryAssets = assets.filter((asset) =>
+    ["STORE", ADMIN_OWNER_ID].includes(asset.ownerID)
+  );
+  const inventoryQuantity = inventoryAssets.reduce(
+    (total, asset) => total + Number(asset.quantity || 1),
+    0
+  );
+  const employees = users.filter((user) => {
+    const role = normalizeRole(user.role);
+    return ["manager", "sales", "warehouse"].includes(role) || (isAdmin && role === "admin");
+  });
+  const customers = users.filter((user) => normalizeRole(user.role) === "customer");
+  const canManageUsers = can("view_users") || can("view_customers") || can("create_staff") || can("create_customer");
+  const creatableRoles = isAdmin
+    ? ["manager", "sales", "warehouse", "customer", "admin"]
+    : isManager
+    ? ["sales", "warehouse"]
+    : isSales
+    ? ["customer"]
+    : [];
 
 
   /*
@@ -826,7 +880,7 @@ useEffect(() => {
     } else if (index === 0) {
       action = "Tạo tài sản";
     } else if (currentOwner && previousOwner && currentOwner !== previousOwner) {
-      action = "Chuyển quyền sở hữu";
+      action = "Cập nhật sở hữu";
     }
 
     const formattedTimestamp = formatBlockchainTimestamp(timestamp);
@@ -838,13 +892,15 @@ useEffect(() => {
       assetID: value?.id || value?.ID || record?.assetID || "",
       assetName: value?.name || value?.Name || "Tài sản",
       ownerID: currentOwner,
+      previousOwnerID: previousOwner,
+      actorID: value?.lastActorID || value?.LastActorID || "",
       value: Number(value?.value || value?.Value || 0),
       status: value?.status || value?.Status || "",
       serialNumber: value?.serialNumber || value?.SerialNumber || "",
       detail: isDelete
         ? "Tài sản đã được xóa trên Blockchain"
         : currentOwner && previousOwner && currentOwner !== previousOwner
-        ? `${previousOwner} → ${currentOwner}`
+        ? `${previousOwner} -> ${currentOwner}`
         : "Dữ liệu tài sản được ghi nhận trên Blockchain",
       time: formattedTimestamp.display,
       timeValue: formattedTimestamp.value,
@@ -870,13 +926,25 @@ useEffect(() => {
       const results = await Promise.all(
         historyAssets.map(async (asset) => {
           try {
-            const data = await invokeChaincode("GetAssetHistory", [asset.id]);
-            const result = parseChaincodeResult(data, []);
-            const records = Array.isArray(result) ? result : [];
+            const data = await apiRequest(`/api/assets/${encodeURIComponent(asset.id)}/history`);
+            const records = Array.isArray(data.data) ? data.data : [];
+            const chronologicalRecords = [...records].sort((left, right) => {
+              const timestampOf = (record) =>
+                record?.timestamp ??
+                record?.Timestamp ??
+                record?.time ??
+                record?.Time ??
+                "";
+
+              return (
+                formatBlockchainTimestamp(timestampOf(left)).value -
+                formatBlockchainTimestamp(timestampOf(right)).value
+              );
+            });
 
             let previous = null;
 
-            const normalized = records.map((record, index) => {
+            const normalized = chronologicalRecords.map((record, index) => {
               const item = normalizeHistoryRecord(record, index, previous);
               if (!record?.isDelete && !record?.IsDelete) {
                 previous = {
@@ -924,46 +992,118 @@ useEffect(() => {
    * =====================================================
    */
 
-  const createUser =
-    async (form) => {
-      if (!isAdmin) {
-        setNotice("Chỉ Admin mới có quyền tạo người dùng");
-        return;
+  const createUserRecord = async (form) => {
+    const response = await apiRequest("/api/users", {
+      method: "POST",
+      body: JSON.stringify({
+        id: form.id?.trim() || "",
+        username: form.username.trim(),
+        password: form.password,
+        fullName: form.fullName.trim(),
+        role: form.role,
+        contact: form.contact?.trim() || "",
+      }),
+    });
+    return response.data;
+  };
+
+  const createUser = async (form) => {
+    const mayCreate = isAdmin || can("create_staff") || can("create_customer");
+    if (!mayCreate) {
+      setNotice("Vai trò hiện tại không có quyền tạo người dùng");
+      return;
+    }
+
+    try {
+      setLoading(true);
+      const created = await createUserRecord(form);
+      await loadUsers();
+      setNotice(`Đã tạo người dùng ${created?.id || form.username} trên Blockchain`);
+      setModal(null);
+    } catch (error) {
+      console.error(error);
+      setNotice(`Lỗi Blockchain: ${error.message}`);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const updateUser = async (form) => {
+    if (!editingUser) return;
+    const body = {};
+    if (!form.contactOnly) body.fullName = form.fullName.trim();
+    if (form.contact !== "" || Object.hasOwn(editingUser, "contact")) {
+      body.contact = form.contact.trim();
+    }
+    if (isAdmin) body.role = form.role;
+    try {
+      setLoading(true);
+      const response = await apiRequest(`/api/users/${encodeURIComponent(editingUser.id)}`, {
+        method: "PUT",
+        body: JSON.stringify(body),
+      });
+      if (editingUser.id === currentUser?.id) {
+        const updatedUser = { ...currentUser, ...response.data };
+        setCurrentUser(updatedUser);
+        localStorage.setItem("assetchain-session", JSON.stringify({ user: updatedUser, token: authToken }));
       }
+      await loadUsers();
+      setEditingUser(null);
+      setModal(null);
+      setNotice("Đã cập nhật thông tin người dùng");
+    } catch (error) {
+      setNotice(`Không thể cập nhật người dùng: ${error.message}`);
+    } finally {
+      setLoading(false);
+    }
+  };
 
-      try {
-        setLoading(true);
+  /*
+   * =====================================================
+   * DELETE USER
+   * =====================================================
+   */
 
-        await invokeChaincode(
-          "CreateUser",
-          [
-            form.id.trim(),
-
-            form.username.trim(),
-
-            form.fullName.trim(),
-
-            form.role,
-          ]
-        );
-
-        await loadUsers();
-
-        setNotice(
-          `Đã tạo người dùng ${form.id} trên Blockchain`
-        );
-
-        setModal(null);
-      } catch (error) {
-        console.error(error);
-
-        setNotice(
-          `Lỗi Blockchain: ${error.message}`
-        );
-      } finally {
-        setLoading(false);
+  const executeDeleteUser = async (user) => {
+    try {
+      setLoading(true);
+      const response = await fetch(`${API_URL}/api/users/${encodeURIComponent(user.id)}`, {
+        method: "DELETE",
+        headers: { Authorization: "Bearer " + authToken },
+      });
+      const result = await response.json();
+      if (!response.ok) {
+        throw new Error(result.message || "Không thể xóa người dùng");
       }
-    };
+      await Promise.all([loadUsers(), loadAssets()]);
+      setConfirmDialog(null);
+      setNotice(`Đã xóa người dùng ${user.username || user.id}`);
+    } catch (error) {
+      console.error(error);
+      setNotice(error.message || "Không thể xóa người dùng");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const deleteUser = (user) => {
+    if (!isAdmin) {
+      setNotice("Chỉ Admin mới có quyền xóa người dùng");
+      return;
+    }
+    if (user.id === currentUser?.id) {
+      setNotice("Bạn không thể tự xóa tài khoản đang đăng nhập");
+      return;
+    }
+    const ownedAssetCount = assets.filter((asset) => asset.ownerID === user.id).length;
+    setConfirmDialog({
+      title: "Xác nhận xóa người dùng",
+      message: `Bạn có chắc chắn muốn xóa “${user.fullName || user.username || user.id}”?\n\nID: ${user.id}\nUsername: ${user.username}\nTài sản đang sở hữu: ${ownedAssetCount}\n\nChỉ có thể xóa khi người dùng không còn sở hữu tài sản.`,
+      confirmText: "Xóa người dùng",
+      danger: true,
+      onConfirm: () => executeDeleteUser(user),
+    });
+  };
 
 
   /*
@@ -1008,8 +1148,13 @@ useEffect(() => {
     const type = form.type || "";
     const ownerID = isAdmin
       ? form.ownerID?.trim() || ""
+      : isEdit
+      ? form.ownerID?.trim() || ""
+      : isWarehouse
+      ? ADMIN_OWNER_ID
       : currentUser?.id || "";
     const value = parseAssetValue(form.value);
+    const quantity = Number(form.quantity);
     const serialNumber = form.serialNumber?.trim() || "";
     const description = form.description?.trim() || "";
 
@@ -1032,7 +1177,7 @@ useEffect(() => {
     }
 
     if (!ownerID) return "Chủ sở hữu không được để trống";
-    if (!users.some((user) => user.id === ownerID)) {
+    if (!["STORE", ADMIN_OWNER_ID].includes(ownerID) && !users.some((user) => user.id === ownerID)) {
       return `User ${ownerID} chưa tồn tại trên Blockchain`;
     }
 
@@ -1041,6 +1186,9 @@ useEffect(() => {
     }
     if (value > 9000000000000000) {
       return "Giá trị tài sản vượt quá giới hạn cho phép";
+    }
+    if (!Number.isSafeInteger(quantity) || quantity < 1) {
+      return "Số lượng sản phẩm phải là số nguyên lớn hơn 0";
     }
 
     if (serialNumber.length > 100) {
@@ -1074,12 +1222,18 @@ useEffect(() => {
       return;
     }
 
-    if (isEdit && !isAdmin && editing?.ownerID !== currentUser?.id) {
-      setNotice("Bạn chỉ có thể chỉnh sửa tài sản của chính mình");
+    if (isEdit && !can("update_asset")) {
+      setNotice("Bạn không có quyền chỉnh sửa tài sản");
       return;
     }
 
-    const ownerID = isAdmin ? form.ownerID?.trim() : currentUser?.id;
+    const ownerID = isAdmin
+      ? form.ownerID?.trim()
+      : isEdit
+      ? form.ownerID?.trim()
+      : isWarehouse
+      ? ADMIN_OWNER_ID
+      : currentUser?.id;
 
     const asset = {
       ...form,
@@ -1088,6 +1242,7 @@ useEffect(() => {
       type: form.type,
       ownerID,
       value: parseAssetValue(form.value),
+      quantity: Number(form.quantity),
       status: form.status,
       serialNumber: form.serialNumber || "",
       description: form.description || "",
@@ -1098,7 +1253,7 @@ useEffect(() => {
       return;
     }
 
-    if (!users.some((user) => user.id === asset.ownerID)) {
+    if (!["STORE", ADMIN_OWNER_ID].includes(asset.ownerID) && !users.some((user) => user.id === asset.ownerID)) {
       setNotice(`User ${asset.ownerID} chưa tồn tại trên Blockchain`);
       return;
     }
@@ -1117,15 +1272,15 @@ useEffect(() => {
       }
 
       if (isEdit) {
-        await invokeChaincode("UpdateAsset", [
-          asset.id, asset.name, asset.type, asset.ownerID, asset.value,
-          asset.status, asset.serialNumber, asset.description,
-        ]);
+        await apiRequest(`/api/assets/${encodeURIComponent(asset.id)}`, {
+          method: "PUT",
+          body: JSON.stringify(asset),
+        });
       } else {
-        await invokeChaincode("CreateAsset", [
-          asset.id, asset.name, asset.type, asset.ownerID, asset.value,
-          asset.status, asset.serialNumber, asset.description,
-        ]);
+        await apiRequest("/api/assets", {
+          method: "POST",
+          body: JSON.stringify(asset),
+        });
       }
 
       await loadAssets();
@@ -1155,11 +1310,14 @@ useEffect(() => {
    * =====================================================
    */
 
-  const executeDeleteAsset = async (asset) => {
+  const executeDeleteAsset = async (asset, quantity) => {
     try {
       setLoading(true);
 
-      await invokeChaincode("DeleteAsset", [asset.id]);
+      await apiRequest(`/api/assets/${encodeURIComponent(asset.id)}`, {
+        method: "DELETE",
+        body: JSON.stringify({ quantity }),
+      });
       await loadAssets();
 
       setNotice("Đã xóa tài sản khỏi Blockchain");
@@ -1176,17 +1334,32 @@ useEffect(() => {
   const deleteAsset = async (asset) => {
     const isOwner = asset?.ownerID === currentUser?.id;
 
-    if (!isAdmin && !isOwner) {
-      setNotice("Bạn chỉ có thể xóa tài sản do chính mình sở hữu");
+    if (!can("delete_asset") && !(isOwner && can("delete_own_asset"))) {
+      setNotice("Bạn không có quyền xóa tài sản này");
       return;
+    }
+
+    const availableQuantity = Number(asset?.quantity || 1);
+    let quantity = availableQuantity;
+    if (availableQuantity > 1) {
+      const answer = window.prompt(
+        `Nhập số lượng muốn xóa (1-${availableQuantity})`,
+        String(availableQuantity)
+      );
+      if (answer === null) return;
+      quantity = Number(answer);
+      if (!Number.isSafeInteger(quantity) || quantity < 1 || quantity > availableQuantity) {
+        setNotice(`Số lượng xóa phải từ 1 đến ${availableQuantity}`);
+        return;
+      }
     }
 
     setConfirmDialog({
       title: "Xác nhận xóa tài sản",
-      message: `Bạn có chắc chắn muốn xóa tài sản “${asset?.name || asset?.id}”?\n\nMã tài sản: ${asset?.id}\nGiá trị: ${money(asset?.value)}\n\nThao tác này sẽ xóa tài sản khỏi Blockchain.`,
+      message: `Bạn có chắc chắn muốn xóa ${quantity}/${availableQuantity} sản phẩm “${asset?.name || asset?.id}”?\n\nMã tài sản: ${asset?.id}\nGiá trị: ${money(asset?.value)}\n\nSố lượng được ghi trực tiếp lên Blockchain.`,
       confirmText: "Xóa tài sản",
       danger: true,
-      onConfirm: () => executeDeleteAsset(asset),
+      onConfirm: () => executeDeleteAsset(asset, quantity),
     });
   };
 
@@ -1196,14 +1369,28 @@ useEffect(() => {
    * =====================================================
    */
 
-  const executeTransferAsset = async (ownerID) => {
+  const executeTransferAsset = async (transfer) => {
     if (!selected) return;
 
     try {
       setLoading(true);
-      await invokeChaincode("TransferAsset", [selected.id, ownerID]);
-
-      const updated = { ...selected, ownerID };
+      let ownerID = transfer.ownerID;
+      if (transfer.newCustomer) {
+        const customer = await createUserRecord({
+          ...transfer.newCustomer,
+          role: "customer",
+        });
+        ownerID = customer.id;
+        await loadUsers();
+      }
+      await apiRequest(`/api/assets/${encodeURIComponent(selected.id)}/transfer`, {
+        method: "POST",
+        body: JSON.stringify({
+          newOwnerID: ownerID,
+          quantity: transfer.quantity,
+          newAssetID: transfer.newAssetID,
+        }),
+      });
       await loadAssets();
 
       setNotice("Đã chuyển quyền sở hữu trên Blockchain");
@@ -1218,10 +1405,12 @@ useEffect(() => {
     }
   };
 
-  const transferAsset = async (ownerID) => {
+  const transferAsset = async (transfer) => {
     if (!selected) return;
 
-    if (isUser && selected.ownerID !== currentUser?.id) {
+    const ownerID = transfer?.ownerID;
+
+    if (isCustomer && selected.ownerID !== currentUser?.id) {
       setNotice("Bạn chỉ có thể chuyển tài sản của chính mình");
       return;
     }
@@ -1231,78 +1420,50 @@ useEffect(() => {
       return;
     }
 
-    if (!users.some((user) => user.id === ownerID)) {
+    if (ownerID !== "STORE" && !transfer?.newCustomer && !users.some((user) => user.id === ownerID)) {
       setNotice(`User ${ownerID} chưa tồn tại trên Blockchain`);
       return;
     }
 
-    const recipient = users.find((user) => user.id === ownerID);
+    const recipient = transfer?.recipient || users.find((user) => user.id === ownerID);
+    const recipientLabel = ownerID === "STORE"
+      ? "Kho cửa hàng (STORE)"
+      : `${recipient?.fullName || recipient?.username || recipient?.id} (${recipient?.id})`;
 
     setConfirmDialog({
-      title: "Xác nhận chuyển quyền",
-      message: `Bạn có chắc chắn muốn chuyển tài sản “${selected.name}”?\n\nMã tài sản: ${selected.id}\n\nChủ sở hữu hiện tại:\n${selected.ownerID}\n\nChủ sở hữu mới:\n${recipient?.fullName || recipient?.username || recipient?.id} (${recipient?.id})\n\nSau khi xác nhận, quyền sở hữu sẽ được ghi lên Blockchain.`,
+      title: isCustomer ? "Xác nhận bán lại cho cửa hàng" : "Xác nhận chuyển quyền",
+      message: `Bạn có chắc chắn muốn chuyển tài sản “${selected.name}”?\n\nMã tài sản: ${selected.id}\nSố lượng: ${transfer.quantity || selected.quantity || 1}\n\nChủ sở hữu hiện tại:\n${selected.ownerID}\n\nChủ sở hữu mới:\n${recipientLabel}\n\nSau khi xác nhận, quyền sở hữu sẽ được ghi lên Blockchain.`,
       confirmText: "Xác nhận chuyển",
       danger: false,
-      onConfirm: () => executeTransferAsset(ownerID),
+      onConfirm: () => executeTransferAsset(transfer),
     });
-  };
-
-  const verifyTransferUser = async (userID) => {
-    const normalizedID = userID?.trim();
-
-    if (!normalizedID) {
-      setNotice("Vui lòng nhập User ID người nhận");
-      return null;
-    }
-
-    if (normalizedID === selected?.ownerID) {
-      setNotice("Không thể chuyển tài sản cho chính chủ sở hữu hiện tại");
-      return null;
-    }
-
-    try {
-      setLoading(true);
-      const data = await invokeChaincode("GetUser", [normalizedID]);
-      const result = parseChaincodeResult(data, null);
-      if (!result || Array.isArray(result) || !result.id) {
-        throw new Error(`User ${normalizedID} không tồn tại`);
-      }
-      return result;
-    } catch (error) {
-      console.error(error);
-      setNotice(`Không tìm thấy người dùng: ${error.message}`);
-      return null;
-    } finally {
-      setLoading(false);
-    }
   };
 
   const login = async () => {
     const username = loginUsername.trim();
-    if (!username) {
-      setNotice("Vui lòng nhập username");
+    if (!username || !loginPassword) {
+      setNotice("Vui lòng nhập username và password");
       return;
     }
 
     try {
       setLoginLoading(true);
-      const data = await invokeChaincode("GetAllUsers", []);
-      const result = parseChaincodeResult(data, []);
-      const userList = Array.isArray(result) ? result : [];
-      setUsers(userList);
-
-      const user = userList.find(
-        (item) => item.username?.trim().toLowerCase() === username.toLowerCase()
-      );
-
-      if (!user) {
-        setNotice("Username không tồn tại trên Blockchain");
-        return;
+      const response = await fetch(`${API_URL}/api/auth/login`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username, password: loginPassword }),
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.message || "Đăng nhập thất bại");
       }
+      const { user, token } = payload.data;
 
       setCurrentUser(user);
-      localStorage.setItem("assetchain-session", JSON.stringify(user));
+      setAuthToken(token);
+      localStorage.setItem("assetchain-session", JSON.stringify({ user, token }));
       setLoginUsername("");
+      setLoginPassword("");
       setPage("dashboard");
     } catch (error) {
       console.error(error);
@@ -1315,6 +1476,7 @@ useEffect(() => {
   const logout = () => {
     localStorage.removeItem("assetchain-session");
     setCurrentUser(null);
+    setAuthToken("");
     setAssets([]);
     setUsers([]);
     setNetwork(null);
@@ -1347,16 +1509,17 @@ useEffect(() => {
             </p>
           </div>
 
-          <button
-            className="primary-button"
-            onClick={() => {
-              setEditing(null);
-
-              setModal("asset");
-            }}
-          >
-            ＋ Thêm tài sản
-          </button>
+          {can("create_asset") && (
+            <button
+              className="primary-button"
+              onClick={() => {
+                setEditing(null);
+                setModal("asset");
+              }}
+            >
+              ＋ Thêm sản phẩm
+            </button>
+          )}
         </div>
 
 
@@ -1364,18 +1527,28 @@ useEffect(() => {
           <Stat
             icon="📦"
             tone="blue"
-            label="Tổng tài sản"
-            value={visibleAssets.length}
-            small={`${activeCount} đang hoạt động`}
+            label={isManager || isWarehouse ? "Tồn kho" : "Tổng tài sản"}
+            value={isManager || isWarehouse ? inventoryQuantity : visibleAssets.length}
+            small={isManager || isWarehouse ? `${inventoryAssets.length} mã sản phẩm` : `${activeCount} đang hoạt động`}
           />
 
           <Stat
             icon="👥"
             tone="green"
-            label={isAdmin ? "Người dùng" : "Tài khoản"}
-            value={isAdmin ? users.length : 1}
-            small={isAdmin ? "Quản lý trên Blockchain" : "Tài khoản hiện tại"}
+            label={isManager ? "Nhân viên" : isAdmin ? "Người dùng" : "Tài khoản"}
+            value={isManager ? employees.length : isAdmin ? users.length : 1}
+            small={isManager ? "Bán hàng và kho" : isAdmin ? "Quản lý trên Blockchain" : ROLE_LABELS[currentRole]}
           />
+
+          {isManager && (
+            <Stat
+              icon="🛍"
+              tone="orange"
+              label="Khách hàng"
+              value={customers.length}
+              small="Tài khoản khách hàng"
+            />
+          )}
 
           <Stat
             icon="↗"
@@ -1508,16 +1681,17 @@ useEffect(() => {
               ↻ Làm mới
             </button>
 
-            <button
-              className="primary-button"
-              onClick={() => {
-                setEditing(null);
-
-                setModal("asset");
-              }}
-            >
-              ＋ Thêm tài sản
-            </button>
+            {can("create_asset") && (
+              <button
+                className="primary-button"
+                onClick={() => {
+                  setEditing(null);
+                  setModal("asset");
+                }}
+              >
+                ＋ Thêm sản phẩm
+              </button>
+            )}
           </div>
         </div>
 
@@ -1555,7 +1729,9 @@ useEffect(() => {
 
   const renderUsers =
     () => {
-      if (!isAdmin) return null;
+      if (!canManageUsers) return null;
+      const effectiveUserTab = can("view_users") ? userTab : "customers";
+      const displayedUsers = effectiveUserTab === "employees" ? employees : customers;
       return (
         <>
         <div className="page-toolbar">
@@ -1570,24 +1746,46 @@ useEffect(() => {
             </p>
           </div>
 
+          {creatableRoles.length > 0 && (
+            <button
+              className="primary-button"
+              onClick={() => {
+                setEditingUser(null);
+                setModal("user");
+              }}
+            >
+              ＋ {isSales ? "Thêm khách hàng" : "Thêm người dùng"}
+            </button>
+          )}
+        </div>
+
+        <div style={{ display: "flex", gap: "12px", marginBottom: "18px" }}>
+          {can("view_users") && (
+            <button
+              className={effectiveUserTab === "employees" ? "primary-button" : "secondary-button"}
+              onClick={() => setUserTab("employees")}
+              style={{ background: effectiveUserTab === "employees" ? "#2563eb" : undefined }}
+            >
+              Nhân viên ({employees.length})
+            </button>
+          )}
           <button
-            className="primary-button"
-            onClick={() =>
-              setModal("user")
-            }
+            className={effectiveUserTab === "customers" ? "primary-button" : "secondary-button"}
+            onClick={() => setUserTab("customers")}
+            style={{ background: effectiveUserTab === "customers" ? "#16a34a" : undefined }}
           >
-            ＋ Thêm người dùng
+            Khách hàng ({customers.length})
           </button>
         </div>
 
-
         <div className="simple-grid">
-          {users.length ? (
-            users.map(
+          {displayedUsers.length ? (
+            displayedUsers.map(
               (user) => (
                 <div
                   className="user-card"
                   key={user.id}
+                  style={{ borderLeft: `4px solid ${effectiveUserTab === "employees" ? "#2563eb" : "#16a34a"}` }}
                 >
                   <div className="avatar">
                     {(user.fullName ||
@@ -1606,13 +1804,12 @@ useEffect(() => {
                       ID: {user.id}
                     </span>
 
-                    <span>
-                      Username:{" "}
-                      {user.username}
-                    </span>
+                    {user.username && <span>Username: {user.username}</span>}
+
+                    {user.contact && <span>SĐT/email: {user.contact}</span>}
 
                     <span>
-                      Role: {user.role}
+                      Vai trò: {ROLE_LABELS[normalizeRole(user.role)] || user.role}
                     </span>
 
                     <span>
@@ -1625,6 +1822,33 @@ useEffect(() => {
                       }{" "}
                       tài sản
                     </span>
+
+                    {user.canEdit && (
+                      <button
+                        className="secondary-button"
+                        type="button"
+                        disabled={loading}
+                        onClick={() => {
+                          setEditingUser(user);
+                          setModal("user");
+                        }}
+                        style={{ marginTop: "12px", marginRight: "8px" }}
+                      >
+                        Sửa thông tin
+                      </button>
+                    )}
+
+                    {isAdmin && user.id !== currentUser?.id && (
+                      <button
+                        className="danger-button"
+                        type="button"
+                        disabled={loading}
+                        onClick={() => deleteUser(user)}
+                        style={{ marginTop: "12px" }}
+                      >
+                        Xóa người dùng
+                      </button>
+                    )}
                   </div>
                 </div>
               )
@@ -1640,7 +1864,31 @@ useEffect(() => {
     };
 
 
-  const visibleTransactions = blockchainHistory;
+  const visibleTransactions = (() => {
+    const normalizedQuery = transactionQuery.trim().toLowerCase();
+    if (!normalizedQuery) return blockchainHistory;
+    const userText = (id) => {
+      const user = users.find((candidate) => candidate.id === id);
+      return user
+        ? [user.id, user.contact, user.username, user.fullName].filter(Boolean).join(" ")
+        : id || "";
+    };
+    return blockchainHistory.filter((transaction) =>
+      [
+        transaction.txId,
+        transaction.assetID,
+        transaction.assetName,
+        transaction.action,
+        transaction.detail,
+        userText(transaction.ownerID),
+        userText(transaction.previousOwnerID),
+        userText(transaction.actorID),
+      ]
+        .join(" ")
+        .toLowerCase()
+        .includes(normalizedQuery)
+    );
+  })();
 
   /*
    * =====================================================
@@ -1665,6 +1913,15 @@ useEffect(() => {
         >
           {historyLoading ? "Đang tải..." : "↻ Làm mới lịch sử"}
         </button>
+      </div>
+
+      <div className="search-box large" style={{ marginBottom: "18px" }}>
+        <span>🔍</span>
+        <input
+          value={transactionQuery}
+          onChange={(event) => setTransactionQuery(event.target.value)}
+          placeholder="Tìm theo SĐT/email, khách hàng, nhân viên, mã tài sản hoặc giao dịch..."
+        />
       </div>
 
       {historyError && (
@@ -1737,6 +1994,36 @@ useEffect(() => {
    * =====================================================
    */
 
+  const toggleRolePermission = (role, permission) => {
+    setPermissionConfig((current) => {
+      if (!current) return current;
+      const selected = current.permissions?.[role] || [];
+      const next = selected.includes(permission)
+        ? selected.filter((item) => item !== permission)
+        : [...selected, permission];
+      return {
+        ...current,
+        permissions: { ...current.permissions, [role]: next },
+      };
+    });
+  };
+
+  const savePermissions = async () => {
+    try {
+      setLoading(true);
+      await apiRequest("/api/permissions", {
+        method: "PUT",
+        body: JSON.stringify({ permissions: permissionConfig.permissions }),
+      });
+      await loadPermissions();
+      setNotice("Đã cập nhật quyền theo vai trò");
+    } catch (error) {
+      setNotice(error.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const renderSettings =
     () => (
       <>
@@ -1762,18 +2049,8 @@ useEffect(() => {
           />
 
           <Setting
-            label="ChainLaunch API"
-            value={CHAINLAUNCH_URL}
-          />
-
-          <Setting
-            label="Chaincode"
-            value={`assetcc (ID: ${CHAINCODE_ID})`}
-          />
-
-          <Setting
-            label="Key ID"
-            value={KEY_ID}
+            label="Kết nối ChainLaunch"
+            value="Thông qua Backend API"
           />
 
           <Setting
@@ -1785,6 +2062,26 @@ useEffect(() => {
             label="Tài khoản hiện tại"
             value={currentUser?.username || "-"}
           />
+
+          {isCustomer && can("update_own_contact") && (
+            <div className="setting-row">
+              <div>
+                <strong>SĐT/email</strong>
+                <div className="muted" style={{ marginTop: "4px" }}>
+                  {currentUser?.contact || "Chưa cập nhật"}
+                </div>
+              </div>
+              <button
+                className="secondary-button"
+                onClick={() => {
+                  setEditingUser({ ...currentUser, canEdit: true });
+                  setModal("user");
+                }}
+              >
+                Sửa SĐT/email
+              </button>
+            </div>
+          )}
 
           <div className="setting-row">
             <div>
@@ -1828,6 +2125,33 @@ useEffect(() => {
               : "Chưa có dữ liệu Network từ Backend"}
           </pre>
         </div>
+
+        {isAdmin && permissionConfig && (
+          <div className="settings-card" style={{ marginTop: "20px" }}>
+            <h3>Phân quyền theo vai trò</h3>
+            <p className="muted">Admin luôn có toàn quyền. Thay đổi dưới đây áp dụng ngay cho các vai trò khác.</p>
+            <div className="simple-grid">
+              {Object.entries(permissionConfig.permissions || {}).map(([role, selected]) => (
+                <div className="user-card" key={role}>
+                  <strong>{ROLE_LABELS[role] || role}</strong>
+                  {Object.entries(PERMISSION_LABELS).map(([permission, label]) => (
+                    <label key={permission} style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+                      <input
+                        type="checkbox"
+                        checked={selected.includes(permission)}
+                        onChange={() => toggleRolePermission(role, permission)}
+                      />
+                      {label}
+                    </label>
+                  ))}
+                </div>
+              ))}
+            </div>
+            <button className="primary-button" onClick={savePermissions} disabled={loading}>
+              Lưu phân quyền
+            </button>
+          </div>
+        )}
       </>
     );
 
@@ -1887,7 +2211,7 @@ useEffect(() => {
             Đăng nhập
           </h1>
           <p className="login-subtitle muted" style={{ marginBottom: "24px" }}>
-            Đăng nhập bằng username được lưu trên Hyperledger Fabric
+            Đăng nhập bằng username và password
           </p>
 
           <div
@@ -1920,13 +2244,37 @@ useEffect(() => {
             />
           </div>
 
+          <div style={{ width: "100%", marginTop: "14px" }}>
+            <input
+              required
+              type="password"
+              autoComplete="current-password"
+              value={loginPassword}
+              onChange={(event) => setLoginPassword(event.target.value)}
+              placeholder="Nhập password"
+              aria-label="Password"
+              style={{
+                display: "block",
+                width: "100%",
+                height: "52px",
+                boxSizing: "border-box",
+                padding: "0 16px",
+                border: "1px solid #d1d5db",
+                borderRadius: "10px",
+                background: "#f9fafb",
+                color: "#111827",
+                fontSize: "16px",
+              }}
+            />
+          </div>
+
           <button
             className="primary-button"
             type="submit"
             disabled={loginLoading}
             style={{ width: "100%", marginTop: "20px" }}
           >
-            {loginLoading ? "Đang kiểm tra Blockchain..." : "Đăng nhập"}
+            {loginLoading ? "Đang xác thực..." : "Đăng nhập"}
           </button>
 
         </form>
@@ -1981,9 +2329,9 @@ useEffect(() => {
         <nav>
           {[
             ["dashboard", "▣", "Dashboard"],
-            ["assets", "▤", "Tài sản"],
-            ...(isAdmin ? [["users", "♙", "Người dùng"]] : []),
-            ["transactions", "◷", "Lịch sử giao dịch"],
+            ["assets", "▤", isWarehouse ? "Sản phẩm trong kho" : "Tài sản"],
+            ...(canManageUsers ? [["users", "♙", "Nhân sự & khách hàng"]] : []),
+            ...(can("view_history") ? [["transactions", "◷", "Lịch sử giao dịch"]] : []),
           ].map(
             ([
               key,
@@ -2131,7 +2479,7 @@ useEffect(() => {
               </div>
 
               <div className="user-role">
-                {isAdmin ? "Administrator" : "User"}
+                {ROLE_LABELS[currentRole] || currentUser?.role}
               </div>
 
             </div>
@@ -2157,7 +2505,7 @@ useEffect(() => {
             renderAssets()}
 
           {page === "users" &&
-            (isAdmin ? renderUsers() : null)}
+            (canManageUsers ? renderUsers() : null)}
 
           {page === "transactions" &&
             renderTransactions()}
@@ -2181,6 +2529,7 @@ useEffect(() => {
           users={users}
           currentUser={currentUser}
           isAdmin={isAdmin}
+          isWarehouse={isWarehouse}
           onCheckAssetId={checkAssetIdExists}
           onClose={() => {
             setModal(null);
@@ -2193,10 +2542,15 @@ useEffect(() => {
 
       {modal === "user" && (
         <UserModal
-          onClose={() =>
-            setModal(null)
-          }
-          onSave={createUser}
+          roles={creatableRoles}
+          initial={editingUser}
+          contactOnly={isCustomer && editingUser?.id === currentUser?.id}
+          allowRoleEdit={isAdmin}
+          onClose={() => {
+            setEditingUser(null);
+            setModal(null);
+          }}
+          onSave={editingUser ? updateUser : createUser}
         />
       )}
 
@@ -2205,9 +2559,7 @@ useEffect(() => {
         <TransferModal
           asset={selected}
           users={users}
-          isAdmin={isAdmin}
-          currentUser={currentUser}
-          onVerifyUser={verifyTransferUser}
+          currentRole={currentRole}
           onClose={() =>
             setModal(null)
           }
@@ -2295,6 +2647,11 @@ useEffect(() => {
                   </strong>
                 </div>
 
+                <div>
+                  <span>Số lượng</span>
+                  <strong>{Number(selected.quantity || 1)}</strong>
+                </div>
+
 
                 <div>
                   <span>
@@ -2349,24 +2706,21 @@ useEffect(() => {
 
               <div className="drawer-actions">
 
-                {(isAdmin || selected.ownerID === currentUser?.id) && (
+                {(isAdmin ||
+                  (can("transfer_asset") && ["STORE", ADMIN_OWNER_ID].includes(selected.ownerID)) ||
+                  (can("sell_back") && selected.ownerID === currentUser?.id)) && (
                   <button
                     className="primary-button"
                     onClick={() => setModal("transfer")}
                   >
-                    Chuyển quyền
+                    {isCustomer ? "Bán lại cho cửa hàng" : isSales ? "Bán sản phẩm" : "Chuyển quyền"}
                   </button>
                 )}
 
-                {(isAdmin || selected.ownerID === currentUser?.id) && (
+                {can("update_asset") && (
                   <button
                     className="secondary-button"
                     onClick={() => {
-                      if (!isAdmin && selected.ownerID !== currentUser?.id) {
-                        setNotice("Bạn chỉ có thể chỉnh sửa tài sản của chính mình");
-                        return;
-                      }
-
                       setEditing(selected);
                       setSelected(null);
                       setModal("asset");
@@ -2376,7 +2730,8 @@ useEffect(() => {
                   </button>
                 )}
 
-                {(isAdmin || selected.ownerID === currentUser?.id) && (
+                {(can("delete_asset") ||
+                  (can("delete_own_asset") && selected.ownerID === currentUser?.id)) && (
                   <button
                     className="danger-button"
                     onClick={() => deleteAsset(selected)}
@@ -2806,6 +3161,10 @@ function AssetTable({
             </th>
 
             <th>
+              SỐ LƯỢNG
+            </th>
+
+            <th>
               TRẠNG THÁI
             </th>
 
@@ -2884,6 +3243,8 @@ function AssetTable({
                     )}
                   </td>
 
+                  <td>{Number(asset.quantity || 1)}</td>
+
 
                   <td>
 
@@ -2913,7 +3274,7 @@ function AssetTable({
             <tr>
 
               <td
-                colSpan="6"
+                colSpan="7"
                 className="empty"
               >
                 Không tìm thấy tài sản
@@ -2942,6 +3303,7 @@ function AssetModal({
   users,
   currentUser,
   isAdmin,
+  isWarehouse,
   onCheckAssetId,
   onClose,
   onSave,
@@ -2953,12 +3315,13 @@ function AssetModal({
   };
 
   const [form, setForm] = useState(() =>
-    initial || {
+    initial ? { ...initial, quantity: Number(initial.quantity || 1) } : {
       id: generateAssetId(),
       name: "",
       type: "Computer",
       ownerID: currentUser?.id || "",
       value: "",
+      quantity: 1,
       status: "Active",
       serialNumber: "",
       description: "",
@@ -3211,6 +3574,8 @@ function AssetModal({
                 -- Chọn người dùng --
               </option>
 
+              <option value="STORE">Kho cửa hàng (STORE)</option>
+
               {users.map((user) => (
                 <option key={user.id} value={user.id}>
                   {user.fullName || user.username || user.id} ({user.id})
@@ -3220,7 +3585,9 @@ function AssetModal({
           ) : (
             <input
               value={
-                currentUser
+                isWarehouse
+                  ? `Admin (${ADMIN_OWNER_ID})`
+                  : currentUser
                   ? `${currentUser.fullName || currentUser.username} (${currentUser.id})`
                   : form.ownerID
               }
@@ -3237,9 +3604,23 @@ function AssetModal({
                 color: "#6b7280",
               }}
             >
-              Chủ sở hữu được khóa theo tài khoản đang đăng nhập.
+              {isWarehouse
+                ? "Sản phẩm mới được ghi dưới tên Admin."
+                : "Chủ sở hữu được khóa theo tài khoản đang đăng nhập."}
             </small>
           )}
+        </label>
+
+        <label>
+          Số lượng
+          <input
+            required
+            type="number"
+            min="1"
+            step="1"
+            value={form.quantity}
+            onChange={(event) => setForm({ ...form, quantity: event.target.value })}
+          />
         </label>
 
 
@@ -3402,142 +3783,116 @@ function AssetModal({
  */
 
 function UserModal({
+  roles,
+  initial,
+  contactOnly,
+  allowRoleEdit,
   onClose,
   onSave,
 }) {
-  const [
-    form,
-    setForm,
-  ] = useState({
-    id: "",
-    username: "",
-    fullName: "",
-    role: "user",
+  const isEdit = Boolean(initial);
+  const [form, setForm] = useState({
+    id: initial?.id || "",
+    username: initial?.username || "",
+    password: "",
+    fullName: initial?.fullName || "",
+    role: normalizeRole(initial?.role) || roles[0] || "customer",
+    contact: initial?.contact || "",
+    contactOnly: Boolean(contactOnly),
   });
-
 
   return (
     <div className="modal-backdrop">
-
       <form
         className="modal"
         onSubmit={(event) => {
           event.preventDefault();
-
           onSave(form);
         }}
       >
+        <h2>{contactOnly ? "Cập nhật SĐT/email" : isEdit ? "Sửa thông tin người dùng" : "Thêm người dùng"}</h2>
 
-        <h2>
-          Thêm người dùng
-        </h2>
-
+        {isEdit && (
+          <label>
+            Mã hệ thống
+            <input value={form.id} disabled readOnly />
+          </label>
+        )}
 
         <label>
-          User ID
-
+          SĐT/email
           <input
-            required
-            value={form.id}
-            placeholder="user01"
-            onChange={(event) =>
-              setForm({
-                ...form,
-                id:
-                  event.target.value,
-              })
-            }
+            value={form.contact}
+            placeholder="Để trống sẽ dùng user_STT"
+            onChange={(event) => setForm({ ...form, contact: event.target.value })}
           />
-
+          {!isEdit && (
+            <small className="muted">Mã hệ thống được tự động tạo theo dạng user_STT.</small>
+          )}
         </label>
 
+        {!contactOnly && (
+          <>
+            <label>
+              Họ và tên
+              <input
+                required
+                value={form.fullName}
+                placeholder="Nguyễn Văn A"
+                onChange={(event) => setForm({ ...form, fullName: event.target.value })}
+              />
+            </label>
 
-        <label>
-          Username
+            {!isEdit && (
+              <>
+                <label>
+                  Username
+                  <input
+                    required
+                    value={form.username}
+                    placeholder="nguyenvana"
+                    onChange={(event) => setForm({ ...form, username: event.target.value })}
+                  />
+                </label>
+                <label>
+                  Password
+                  <input
+                    required
+                    type="password"
+                    minLength={8}
+                    autoComplete="new-password"
+                    value={form.password}
+                    placeholder="Tối thiểu 8 ký tự"
+                    onChange={(event) => setForm({ ...form, password: event.target.value })}
+                  />
+                </label>
+              </>
+            )}
 
-          <input
-            required
-            value={form.username}
-            placeholder="nguyenvana"
-            onChange={(event) =>
-              setForm({
-                ...form,
-                username:
-                  event.target.value,
-              })
-            }
-          />
-
-        </label>
-
-
-        <label>
-          Họ và tên
-
-          <input
-            required
-            value={form.fullName}
-            placeholder="Nguyen Van A"
-            onChange={(event) =>
-              setForm({
-                ...form,
-                fullName:
-                  event.target.value,
-              })
-            }
-          />
-
-        </label>
-
-
-        <label>
-          Vai trò
-
-          <select
-            value={form.role}
-            onChange={(event) =>
-              setForm({
-                ...form,
-                role:
-                  event.target.value,
-              })
-            }
-          >
-
-            <option value="user">
-              User
-            </option>
-
-            <option value="admin">
-              Admin
-            </option>
-
-          </select>
-
-        </label>
-
+            <label>
+              Vai trò
+              <select
+                value={form.role}
+                disabled={isEdit && !allowRoleEdit}
+                onChange={(event) => setForm({ ...form, role: event.target.value })}
+              >
+                {(isEdit && !roles.includes(form.role) ? [form.role, ...roles] : roles).map((role) => (
+                  <option key={role} value={role}>
+                    {ROLE_LABELS[role] || role}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </>
+        )}
 
         <div className="modal-actions">
-
-          <button
-            type="button"
-            className="secondary-button"
-            onClick={onClose}
-          >
-            Hủy
+          <button type="button" className="secondary-button" onClick={onClose}>Hủy</button>
+          <button className="primary-button">
+            {isEdit ? "Lưu thay đổi" : "Tạo người dùng"}
           </button>
-
-
-          <button
-            className="primary-button"
-          >
-            Tạo người dùng
-          </button>
-
         </div>
-
       </form>
-
     </div>
   );
 }
@@ -3552,111 +3907,121 @@ function UserModal({
 function TransferModal({
   asset,
   users,
-  isAdmin,
-  currentUser,
-  onVerifyUser,
+  currentRole,
   onClose,
   onSave,
 }) {
-  const [owner, setOwner] = useState("");
-  const [targetID, setTargetID] = useState("");
-  const [targetUser, setTargetUser] = useState(null);
-  const [verifying, setVerifying] = useState(false);
+  const isSales = currentRole === "sales";
+  const isCustomer = currentRole === "customer";
+  const availableUsers = users.filter((user) =>
+    user.id !== asset?.ownerID &&
+    (!isSales || normalizeRole(user.role) === "customer")
+  );
+  const [owner, setOwner] = useState(isCustomer ? "STORE" : "");
+  const [quantity, setQuantity] = useState(1);
+  const [showNewCustomer, setShowNewCustomer] = useState(false);
+  const [customerForm, setCustomerForm] = useState({
+    id: "",
+    username: "",
+    password: "",
+    fullName: "",
+    contact: "",
+  });
 
-  const availableUsers = users.filter((user) => user.id !== asset?.ownerID);
+  const generateSaleAssetId = () =>
+    `SALE-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
 
-  const verifyUser = async () => {
-    setVerifying(true);
-    const result = await onVerifyUser(targetID);
-    setTargetUser(result);
-    setVerifying(false);
+  const submit = (event) => {
+    event.preventDefault();
+    let selectedOwner = owner;
+    if (isSales && showNewCustomer) {
+      selectedOwner = "NEW_CUSTOMER";
+    }
+    if (!selectedOwner) return;
+    onSave({
+      ownerID: selectedOwner,
+      quantity: isCustomer ? Number(asset?.quantity || 1) : Number(quantity),
+      newAssetID: generateSaleAssetId(),
+      newCustomer: isSales && showNewCustomer ? customerForm : null,
+      recipient: isSales && showNewCustomer
+        ? { ...customerForm, id: "Tự động", role: "CUSTOMER" }
+        : null,
+    });
   };
 
   return (
     <div className="modal-backdrop">
-      <form
-        className="modal"
-        onSubmit={(event) => {
-          event.preventDefault();
-          if (isAdmin) onSave(owner);
-          else if (targetUser) onSave(targetUser.id);
-        }}
-      >
-        <h2>Chuyển quyền sở hữu</h2>
-
-        <p className="muted">
-          {asset?.name} ({asset?.id})
-        </p>
+      <form className="modal" onSubmit={submit}>
+        <h2>{isCustomer ? "Bán lại cho cửa hàng" : "Bán / chuyển quyền sở hữu"}</h2>
+        <p className="muted">{asset?.name} ({asset?.id}) · Có {Number(asset?.quantity || 1)} sản phẩm</p>
 
         <label>
           Chủ sở hữu hiện tại
           <input disabled value={asset?.ownerID || ""} />
         </label>
 
-        {isAdmin ? (
+        {isCustomer ? (
           <label>
-            Chủ sở hữu mới
-            <select
-              required
-              value={owner}
-              onChange={(event) => setOwner(event.target.value)}
-            >
-              <option value="">-- Chọn người dùng --</option>
-              {availableUsers.map((user) => (
-                <option key={user.id} value={user.id}>
-                  {user.fullName || user.username || user.id} ({user.id})
-                </option>
-              ))}
-            </select>
+            Bên mua lại
+            <input disabled value="Kho cửa hàng (STORE)" />
           </label>
         ) : (
           <>
             <label>
-              User ID người nhận
-              <div style={{ display: "flex", gap: "8px" }}>
-                <input
-                  required
-                  value={targetID}
-                  onChange={(event) => {
-                    setTargetID(event.target.value);
-                    setTargetUser(null);
-                  }}
-                  placeholder="Ví dụ: user01"
-                />
-                <button
-                  type="button"
-                  className="secondary-button"
-                  onClick={verifyUser}
-                  disabled={verifying}
-                >
-                  {verifying ? "Đang kiểm tra..." : "Kiểm tra"}
-                </button>
-              </div>
+              {isSales ? "Khách hàng" : "Chủ sở hữu mới"}
+              <select
+                required={!showNewCustomer}
+                disabled={showNewCustomer}
+                value={owner}
+                onChange={(event) => setOwner(event.target.value)}
+              >
+                <option value="">-- Chọn người nhận --</option>
+                {availableUsers.map((user) => (
+                  <option key={user.id} value={user.id}>
+                    {user.fullName || user.username || user.id} ({user.id})
+                  </option>
+                ))}
+              </select>
             </label>
 
-            {targetUser && (
+            <label>
+              Số lượng bán/chuyển
+              <input
+                required
+                type="number"
+                min="1"
+                max={Number(asset?.quantity || 1)}
+                value={quantity}
+                onChange={(event) => setQuantity(event.target.value)}
+              />
+            </label>
+
+            {isSales && (
+              <label style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+                <input
+                  type="checkbox"
+                  checked={showNewCustomer}
+                  onChange={(event) => setShowNewCustomer(event.target.checked)}
+                />
+                Thêm khách hàng mới ngay khi bán
+              </label>
+            )}
+
+            {isSales && showNewCustomer && (
               <div className="user-card">
-                <div className="avatar">
-                  {(targetUser.fullName || targetUser.id).slice(0, 2).toUpperCase()}
-                </div>
-                <div>
-                  <strong>{targetUser.fullName || targetUser.id}</strong>
-                  <span>ID: {targetUser.id}</span>
-                  <span>Username: {targetUser.username}</span>
-                  <span>Role: {targetUser.role}</span>
-                </div>
+                <input placeholder="SĐT/email (để trống sẽ dùng user_STT)" value={customerForm.contact} onChange={(event) => setCustomerForm({ ...customerForm, contact: event.target.value })} />
+                <input required placeholder="Username" value={customerForm.username} onChange={(event) => setCustomerForm({ ...customerForm, username: event.target.value })} />
+                <input required placeholder="Họ và tên" value={customerForm.fullName} onChange={(event) => setCustomerForm({ ...customerForm, fullName: event.target.value })} />
+                <input required minLength={8} type="password" placeholder="Password tối thiểu 8 ký tự" value={customerForm.password} onChange={(event) => setCustomerForm({ ...customerForm, password: event.target.value })} />
               </div>
             )}
           </>
         )}
 
         <div className="modal-actions">
-          <button type="button" className="secondary-button" onClick={onClose}>
-            Hủy
-          </button>
-
-          <button className="primary-button" disabled={!isAdmin && !targetUser}>
-            Xác nhận chuyển
+          <button type="button" className="secondary-button" onClick={onClose}>Hủy</button>
+          <button className="primary-button" disabled={!isCustomer && !showNewCustomer && !owner}>
+            {isCustomer ? "Xác nhận bán lại" : "Xác nhận bán/chuyển"}
           </button>
         </div>
       </form>
