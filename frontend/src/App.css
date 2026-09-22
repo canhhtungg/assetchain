@@ -645,6 +645,48 @@ button { font: inherit; }
 .setting-row em.online { color:#15803d; background:#dcfce7; }
 .setting-row em.offline { color:#b91c1c; background:#fee2e2; }
 .settings-card pre { margin-top:16px; padding:16px; background:#111827; color:#a7f3d0; border-radius:8px; overflow:auto; max-height:380px; font-size:12px; }
+
+.permission-settings-card { max-width:none; }
+.permission-settings-card > .muted { margin:6px 0 18px; }
+.permission-matrix-scroll { border:1px solid #e2e8f0; border-radius:10px; overflow:auto; max-width:100%; }
+.permission-matrix { width:max-content; min-width:100%; border-collapse:separate; border-spacing:0; table-layout:fixed; }
+.permission-matrix th,
+.permission-matrix td { border-top:0; border-right:1px solid #e2e8f0; border-bottom:1px solid #e2e8f0; }
+.permission-matrix tr:last-child th,
+.permission-matrix tr:last-child td { border-bottom:0; }
+.permission-matrix th:last-child,
+.permission-matrix td:last-child { border-right:0; }
+.permission-matrix thead th { position:sticky; top:0; z-index:2; height:92px; padding:12px 9px; background:#f8fafc; color:#334155; text-align:center; vertical-align:bottom; white-space:normal; line-height:1.3; }
+.permission-matrix .permission-role-column { position:sticky; left:0; z-index:3; width:190px; min-width:190px; max-width:190px; padding:14px 16px; background:#f8fafc; text-align:left; vertical-align:middle; }
+.permission-matrix thead .permission-role-column { z-index:4; vertical-align:bottom; }
+.permission-role-column span { display:block; color:#172033; font-size:13px; }
+.permission-role-column small { display:block; margin-top:4px; color:#64748b; font-size:10px; font-weight:700; }
+.permission-column { width:122px; min-width:122px; max-width:122px; }
+.permission-cell { height:58px; padding:0; background:#fff; text-align:center; vertical-align:middle; }
+.permission-cell label { display:flex; align-items:center; justify-content:center; width:100%; height:100%; cursor:pointer; }
+.permission-cell input { width:18px; height:18px; margin:0; accent-color:#2563eb; cursor:pointer; }
+.permission-cell input:disabled { cursor:not-allowed; opacity:.75; }
+.permission-admin-row .permission-role-column,
+.permission-admin-row .permission-cell { background:#eff6ff; }
+.permission-admin-row .permission-role-column span { color:#1d4ed8; }
+.permission-matrix tbody tr:not(.permission-admin-row):hover .permission-cell,
+.permission-matrix tbody tr:not(.permission-admin-row):hover .permission-role-column { background:#f8fafc; }
+.permission-matrix-actions { display:flex; align-items:center; justify-content:space-between; gap:16px; margin-top:16px; }
+.permission-matrix-actions .primary-button { flex:0 0 auto; }
+
+[data-assetchain-theme="dark"] .permission-matrix-scroll { border-color:#334155; }
+[data-assetchain-theme="dark"] .permission-matrix th,
+[data-assetchain-theme="dark"] .permission-matrix td { border-color:#334155 !important; }
+[data-assetchain-theme="dark"] .permission-matrix thead th,
+[data-assetchain-theme="dark"] .permission-matrix .permission-role-column { background:#0f172a !important; }
+[data-assetchain-theme="dark"] .permission-role-column span { color:#f8fafc; }
+[data-assetchain-theme="dark"] .permission-cell { background:#111827; }
+[data-assetchain-theme="dark"] .permission-admin-row .permission-role-column,
+[data-assetchain-theme="dark"] .permission-admin-row .permission-cell { background:#172554 !important; }
+[data-assetchain-theme="dark"] .permission-admin-row .permission-role-column span { color:#bfdbfe; }
+[data-assetchain-theme="dark"] .permission-matrix tbody tr:not(.permission-admin-row):hover .permission-cell,
+[data-assetchain-theme="dark"] .permission-matrix tbody tr:not(.permission-admin-row):hover .permission-role-column { background:#172033 !important; }
+
 .modal-backdrop,.drawer-backdrop { position:fixed; inset:0; background:rgba(15,23,42,.42); display:flex; align-items:center; justify-content:center; z-index:20; padding:20px; }
 .modal { width:min(520px,100%); max-height:90vh; overflow:auto; background:white; border-radius:14px; padding:24px; box-shadow:0 20px 50px rgba(0,0,0,.2); }
 .modal h2 { margin-bottom:8px; }
@@ -664,4 +706,4 @@ button { font: inherit; }
 .status.inactive { background:#e2e8f0; color:#475569; }
 .status-dot.offline { background:#ef4444; }
 @media (max-width:900px) { .simple-grid{grid-template-columns:1fr 1fr;} .header-right{gap:10px;} }
-@media (max-width:650px) { .simple-grid{grid-template-columns:1fr;} .page-toolbar,.welcome{align-items:flex-start; gap:14px; flex-direction:column;} .table-card{overflow:auto;} table{min-width:720px;} .header{padding:0 16px;} .user-profile>div:last-child{display:none;} .setting-row{grid-template-columns:1fr;} }
+@media (max-width:650px) { .simple-grid{grid-template-columns:1fr;} .page-toolbar,.welcome{align-items:flex-start; gap:14px; flex-direction:column;} .table-card{overflow:auto;} table{min-width:720px;} .header{padding:0 16px;} .user-profile>div:last-child{display:none;} .setting-row{grid-template-columns:1fr;} .permission-matrix-actions{align-items:stretch; flex-direction:column;} .permission-matrix-actions .primary-button{width:100%;} .permission-matrix .permission-role-column{width:145px;min-width:145px;max-width:145px;} }

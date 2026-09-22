@@ -14,6 +14,14 @@ const ROLE_LABELS = {
   customer: "Khách hàng",
 };
 
+const ROLE_PERMISSION_ORDER = [
+  { role: "admin", abbreviation: "Admin" },
+  { role: "manager", abbreviation: "QL" },
+  { role: "sales", abbreviation: "NVBH" },
+  { role: "warehouse", abbreviation: "NVK" },
+  { role: "customer", abbreviation: "KH" },
+];
+
 const PERMISSION_LABELS = {
   view_all_assets: "Xem toàn bộ tài sản",
   view_inventory: "Xem hàng trong kho",
@@ -2131,29 +2139,61 @@ useEffect(() => {
         </div>
 
         {isAdmin && permissionConfig && (
-          <div className="settings-card" style={{ marginTop: "20px" }}>
+          <div className="settings-card permission-settings-card" style={{ marginTop: "20px" }}>
             <h3>Phân quyền theo vai trò</h3>
-            <p className="muted">Admin luôn có toàn quyền. Thay đổi dưới đây áp dụng ngay cho các vai trò khác.</p>
-            <div className="simple-grid">
-              {Object.entries(permissionConfig.permissions || {}).map(([role, selected]) => (
-                <div className="user-card" key={role}>
-                  <strong>{ROLE_LABELS[role] || role}</strong>
-                  {Object.entries(PERMISSION_LABELS).map(([permission, label]) => (
-                    <label key={permission} style={{ display: "flex", gap: "8px", alignItems: "center" }}>
-                      <input
-                        type="checkbox"
-                        checked={selected.includes(permission)}
-                        onChange={() => toggleRolePermission(role, permission)}
-                      />
-                      {label}
-                    </label>
-                  ))}
-                </div>
-              ))}
+            <p className="muted">
+              Tích chọn quyền cho từng vai trò rồi lưu thay đổi. Admin luôn có toàn quyền và không thể chỉnh sửa.
+            </p>
+
+            <div className="permission-matrix-scroll">
+              <table className="permission-matrix">
+                <thead>
+                  <tr>
+                    <th className="permission-role-column">Vai trò người dùng</th>
+                    {Object.entries(PERMISSION_LABELS).map(([permission, label]) => (
+                      <th className="permission-column" key={permission} scope="col">
+                        {label}
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {ROLE_PERMISSION_ORDER.map(({ role, abbreviation }) => {
+                    const isAdminRole = role === "admin";
+                    const selected = permissionConfig.permissions?.[role] || [];
+
+                    return (
+                      <tr className={isAdminRole ? "permission-admin-row" : ""} key={role}>
+                        <th className="permission-role-column" scope="row">
+                          <span>{ROLE_LABELS[role]}</span>
+                          <small>{abbreviation}</small>
+                        </th>
+                        {Object.entries(PERMISSION_LABELS).map(([permission, label]) => (
+                          <td className="permission-cell" key={permission}>
+                            <label title={`${ROLE_LABELS[role]} — ${label}`}>
+                              <input
+                                type="checkbox"
+                                checked={isAdminRole || selected.includes(permission)}
+                                disabled={isAdminRole || loading}
+                                onChange={() => toggleRolePermission(role, permission)}
+                                aria-label={`${ROLE_LABELS[role]}: ${label}`}
+                              />
+                            </label>
+                          </td>
+                        ))}
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
             </div>
-            <button className="primary-button" onClick={savePermissions} disabled={loading}>
-              Lưu phân quyền
-            </button>
+
+            <div className="permission-matrix-actions">
+              <span className="muted">Cuộn ngang để xem toàn bộ quyền.</span>
+              <button className="primary-button" onClick={savePermissions} disabled={loading}>
+                {loading ? "Đang lưu..." : "Lưu phân quyền"}
+              </button>
+            </div>
           </div>
         )}
       </>
