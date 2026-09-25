@@ -50,6 +50,19 @@ class AuthenticationApiTest(unittest.TestCase):
         self.assertIn("max-age=31536000", response.headers["Strict-Transport-Security"])
         self.assertEqual(response.headers["Cache-Control"], "no-store")
 
+    def test_runtime_secret_prefers_systemd_credential(self):
+        with tempfile.TemporaryDirectory() as directory:
+            credential_path = os.path.join(directory, "APP_SECRET")
+            with open(credential_path, "w", encoding="utf-8") as output:
+                output.write("credential-store-value\n")
+            with patch.dict(
+                os.environ,
+                {"CREDENTIALS_DIRECTORY": directory, "APP_SECRET": "environment-value"},
+            ):
+                self.assertEqual(
+                    backend.runtime_secret("APP_SECRET"), "credential-store-value"
+                )
+
     def test_parse_chaincode_result_handles_chainlaunch_envelope(self):
         result = {
             "data": {

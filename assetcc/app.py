@@ -18,6 +18,17 @@ from werkzeug.security import check_password_hash, generate_password_hash
 load_dotenv()
 
 
+def runtime_secret(name):
+    credentials_directory = os.getenv("CREDENTIALS_DIRECTORY")
+    if credentials_directory:
+        credential_path = Path(credentials_directory) / name
+        try:
+            return credential_path.read_text(encoding="utf-8").rstrip("\r\n")
+        except OSError:
+            pass
+    return os.getenv(name)
+
+
 # ==========================================
 # FLASK CONFIG
 # ==========================================
@@ -64,11 +75,11 @@ FABRIC_HOST = os.getenv(
     "http://127.0.0.1:8100/api/v1"
 )
 
-FABRIC_USERNAME = os.getenv("FABRIC_USERNAME")
+FABRIC_USERNAME = runtime_secret("FABRIC_USERNAME")
 
-FABRIC_PASSWORD = os.getenv("FABRIC_PASSWORD")
+FABRIC_PASSWORD = runtime_secret("FABRIC_PASSWORD")
 
-APP_SECRET = os.getenv("APP_SECRET")
+APP_SECRET = runtime_secret("APP_SECRET")
 AUTH_TOKEN_MAX_AGE = int(os.getenv("AUTH_TOKEN_MAX_AGE", "28800"))
 AUTH_CREDENTIALS_FILE = os.getenv("AUTH_CREDENTIALS_FILE")
 ROLE_PERMISSIONS_FILE = os.getenv("ROLE_PERMISSIONS_FILE") or str(
