@@ -65,6 +65,12 @@ const money = (value) =>
   " ₫";
 
 
+const isSoldAsset = (asset) => {
+  const status = String(asset?.status || "").trim().toLowerCase();
+  const ownerID = String(asset?.ownerID || "");
+  return status === "sold" || !["STORE", ADMIN_OWNER_ID].includes(ownerID);
+};
+
 function parseChaincodeResult(data, fallback = []) {
   let result =
     data?.result?.result ??
@@ -351,6 +357,8 @@ function App() {
   const [loginLoading, setLoginLoading] = useState(false);
   const [permissions, setPermissions] = useState([]);
   const [permissionConfig, setPermissionConfig] = useState(null);
+  const [passwordResetRequests, setPasswordResetRequests] = useState([]);
+  const [requestsLoading, setRequestsLoading] = useState(false);
   const [userTab, setUserTab] = useState("employees");
   const [editingUser, setEditingUser] = useState(null);
   const [transactionQuery, setTransactionQuery] = useState("");
@@ -382,6 +390,7 @@ function App() {
   const isWarehouse = currentRole === "warehouse";
   const isCustomer = currentRole === "customer";
   const can = (permission) => isAdmin || permissions.includes(permission);
+  const pendingResetCount = passwordResetRequests.filter((item) => item.status === "pending").length;
 
   useEffect(() => {
     try {
@@ -494,7 +503,25 @@ useEffect(() => {
     });
     const data = await response.json();
     if (!response.ok) {
-      throw new Error(data.message || "Yêu cầu không thành công");
+      if (data.code === "PASSWORD_CHANGE_REQUIRED") {
+        setCurrentUser((current) => {
+          if (!current) return current;
+          const updated = { ...current, mustChangePassword: true };
+          localStorage.setItem(
+            "assetchain-session",
+            JSON.stringify({ user: updated, token: authToken })
+          );
+          return updated;
+        });
+      }
+      if (data.code === "SESSION_REVOKED") {
+        localStorage.removeItem("assetchain-session");
+        setCurrentUser(null);
+        setAuthToken("");
+      }
+      const error = new Error(data.message || "Yêu cầu không thành công");
+      error.code = data.code;
+      throw error;
     }
     return data;
   };
@@ -587,6 +614,19 @@ useEffect(() => {
     }
   };
 
+  const loadPasswordResetRequests = async () => {
+    if (normalizeRole(currentUser?.role) !== "admin") return [];
+    try {
+      setRequestsLoading(true);
+      const data = await apiRequest("/api/password-reset-requests");
+      const items = Array.isArray(data.data) ? data.data : [];
+      setPasswordResetRequests(items);
+      return items;
+    } finally {
+      setRequestsLoading(false);
+    }
+  };
+
 
   /*
    * =====================================================
@@ -632,8 +672,9 @@ useEffect(() => {
       await Promise.all([
         loadAssets(),
         loadUsers(),
-        loadNetworks(),
+        isAdmin ? loadNetworks() : Promise.resolve(),
         loadPermissions(),
+        isAdmin ? loadPasswordResetRequests() : Promise.resolve(),
       ]);
     } catch (error) {
       console.error(error);
@@ -649,7 +690,7 @@ useEffect(() => {
 
 
   useEffect(() => {
-    if (currentUser) loadAll();
+    if (currentUser && !currentUser.mustChangePassword) loadAll();
   }, [currentUser]);
 
 
@@ -671,13 +712,17 @@ useEffect(() => {
   }, [assets, currentUser, isAdmin, permissions]);
 
   const filteredAssets = useMemo(() => {
-    return visibleAssets.filter((asset) =>
+    const matching = visibleAssets.filter((asset) =>
       [asset.id, asset.name, asset.type, asset.ownerID, asset.status]
         .join(" ")
         .toLowerCase()
         .includes(query.toLowerCase())
     );
-  }, [visibleAssets, query]);
+    if (isAdmin || isManager) {
+      return [...matching].sort((left, right) => Number(isSoldAsset(left)) - Number(isSoldAsset(right)));
+    }
+    return matching;
+  }, [visibleAssets, query, isAdmin, isManager]);
 
 
   /*
@@ -879,19 +924,50 @@ useEffect(() => {
       record?.Deleted
     );
 
-    const currentOwner = value?.ownerID || value?.OwnerID || "";
-    const previousOwner = previousAsset?.ownerID || "";
+    const currentOwner =
+      record?.toOwnerID || value?.ownerID || value?.OwnerID || "";
+    const previousOwner =
+      record?.fromOwnerID || previousAsset?.ownerID || "";
+    const actorID =
+      record?.actorID || value?.lastActorID || value?.LastActorID || "";
+    const actor = record?.actor || null;
+    const fromOwner = record?.fromOwner || null;
+    const toOwner = record?.toOwner || null;
+    const labelFor = (profile, fallback) => {
+      if (!profile) return fallback || "-";
+      const username = profile.username || profile.id || fallback || "-";
+      const fullName = profile.fullName;
+      return fullName && fullName !== username ? `${username} (${fullName})` : username;
+    };
+    const actorLabel = actorID
+      ? labelFor(actor, actorID)
+      : "Không xác định (giao dịch cũ)";
+    const fromOwnerLabel = labelFor(fromOwner, previousOwner);
+    const toOwnerLabel = labelFor(toOwner, currentOwner);
+    const operation = record?.operation || "";
 
     let action = "Cập nhật";
-    if (isDelete) {
+    if (operation === "delete" || isDelete) {
       action = "Xóa tài sản";
-    } else if (index === 0) {
+    } else if (operation === "transfer" || (currentOwner && previousOwner && currentOwner !== previousOwner)) {
+      action = "Chuyển quyền sở hữu";
+    } else if (operation === "create" || index === 0) {
       action = "Tạo tài sản";
-    } else if (currentOwner && previousOwner && currentOwner !== previousOwner) {
-      action = "Cập nhật sở hữu";
     }
 
     const formattedTimestamp = formatBlockchainTimestamp(timestamp);
+    let detail = actorID
+      ? `${actorLabel} thực hiện cập nhật tài sản`
+      : "Dữ liệu tài sản được ghi nhận trên Blockchain";
+    if (action === "Chuyển quyền sở hữu") {
+      detail = `${actorLabel} chuyển tài sản từ ${fromOwnerLabel} sang ${toOwnerLabel}`;
+    } else if (action === "Tạo tài sản") {
+      detail = `${actorLabel} tạo tài sản cho ${toOwnerLabel}`;
+    } else if (action === "Xóa tài sản") {
+      detail = actorID
+        ? `${actorLabel} xóa tài sản của ${fromOwnerLabel}`
+        : `Tài sản của ${fromOwnerLabel} đã được xóa trên Blockchain`;
+    }
 
     return {
       id: txId,
@@ -900,16 +976,15 @@ useEffect(() => {
       assetID: value?.id || value?.ID || record?.assetID || "",
       assetName: value?.name || value?.Name || "Tài sản",
       ownerID: currentOwner,
+      ownerLabel: toOwnerLabel,
       previousOwnerID: previousOwner,
-      actorID: value?.lastActorID || value?.LastActorID || "",
+      previousOwnerLabel: fromOwnerLabel,
+      actorID,
+      actorLabel,
       value: Number(value?.value || value?.Value || 0),
       status: value?.status || value?.Status || "",
       serialNumber: value?.serialNumber || value?.SerialNumber || "",
-      detail: isDelete
-        ? "Tài sản đã được xóa trên Blockchain"
-        : currentOwner && previousOwner && currentOwner !== previousOwner
-        ? `${previousOwner} -> ${currentOwner}`
-        : "Dữ liệu tài sản được ghi nhận trên Blockchain",
+      detail,
       time: formattedTimestamp.display,
       timeValue: formattedTimestamp.value,
       raw: record,
@@ -1006,7 +1081,6 @@ useEffect(() => {
       body: JSON.stringify({
         id: form.id?.trim() || "",
         username: form.username.trim(),
-        password: form.password,
         fullName: form.fullName.trim(),
         role: form.role,
         contact: form.contact?.trim() || "",
@@ -1481,6 +1555,63 @@ useEffect(() => {
     }
   };
 
+  const sendPasswordResetRequest = () => {
+    const username = loginUsername.trim();
+    if (!username) {
+      setNotice("Vui lòng nhập username trước khi gửi yêu cầu");
+      return;
+    }
+    setConfirmDialog({
+      title: "Quên mật khẩu",
+      message: "Gửi yêu cầu đến admin",
+      confirmText: "Đồng ý",
+      onConfirm: async () => {
+        try {
+          setLoginLoading(true);
+          const response = await fetch(`${API_URL}/api/auth/password-reset-requests`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ username }),
+          });
+          const payload = await response.json();
+          if (!response.ok) throw new Error(payload.message || "Không thể gửi yêu cầu");
+          setNotice(payload.message || "Yêu cầu đã được gửi đến Admin");
+          setConfirmDialog(null);
+        } catch (error) {
+          setNotice(error.message || "Không thể gửi yêu cầu");
+        } finally {
+          setLoginLoading(false);
+        }
+      },
+    });
+  };
+
+  const changeCurrentPassword = async ({ currentPassword, newPassword }) => {
+    try {
+      setLoading(true);
+      const response = await fetch(`${API_URL}/api/auth/change-password`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${authToken}`,
+        },
+        body: JSON.stringify({ currentPassword, newPassword }),
+      });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.message || "Không thể đổi mật khẩu");
+      const { user, token } = payload.data;
+      setCurrentUser(user);
+      setAuthToken(token);
+      localStorage.setItem("assetchain-session", JSON.stringify({ user, token }));
+      setNotice("Đổi mật khẩu thành công");
+      setPage("dashboard");
+    } catch (error) {
+      setNotice(error.message || "Không thể đổi mật khẩu");
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const logout = () => {
     localStorage.removeItem("assetchain-session");
     setCurrentUser(null);
@@ -1488,6 +1619,7 @@ useEffect(() => {
     setAssets([]);
     setUsers([]);
     setNetwork(null);
+    setPasswordResetRequests([]);
     setSelected(null);
     setEditing(null);
     setModal(null);
@@ -1982,8 +2114,8 @@ useEffect(() => {
                   <td>
                     {transaction.assetName} <small>({transaction.assetID})</small>
                   </td>
-                  <td>{transaction.ownerID || "-"}</td>
-                  <td>{transaction.detail || "-"}</td>
+                  <td>{transaction.ownerLabel || transaction.ownerID || "-"}</td>
+                  <td className="transaction-detail">{transaction.detail || "-"}</td>
                   <td>{transaction.time}</td>
                 </tr>
               ))
@@ -1999,6 +2131,122 @@ useEffect(() => {
       </div>
     </>
   );
+
+  const reviewPasswordResetRequest = (item, decision) => {
+    const approving = decision === "approve";
+    setConfirmDialog({
+      title: approving ? "Chấp nhận yêu cầu đặt lại mật khẩu" : "Từ chối yêu cầu",
+      message: approving
+        ? `Đặt mật khẩu của ${item.username || item.userID} về 12345678?\n\nNgười dùng sẽ phải đổi mật khẩu ngay lần đăng nhập tiếp theo.`
+        : `Từ chối yêu cầu của ${item.username || item.userID}?`,
+      confirmText: approving ? "Chấp nhận" : "Từ chối",
+      danger: !approving,
+      onConfirm: async () => {
+        try {
+          setLoading(true);
+          const response = await apiRequest(
+            `/api/password-reset-requests/${encodeURIComponent(item.id)}/${decision}`,
+            { method: "POST" }
+          );
+          await loadPasswordResetRequests();
+          setNotice(response.message);
+          setConfirmDialog(null);
+        } catch (error) {
+          setNotice(error.message);
+        } finally {
+          setLoading(false);
+        }
+      },
+    });
+  };
+
+  const requestAdminResetPassword = (user) => {
+    setEditingUser(null);
+    setModal(null);
+    setConfirmDialog({
+      title: "Đặt lại mật khẩu mặc định",
+      message: `Đặt mật khẩu của ${user.username || user.id} về 12345678?\n\nCác phiên đăng nhập hiện tại sẽ hết hiệu lực và người dùng phải đổi mật khẩu khi đăng nhập lại.`,
+      confirmText: "Đặt lại mật khẩu",
+      danger: true,
+      onConfirm: async () => {
+        try {
+          setLoading(true);
+          const response = await apiRequest(
+            `/api/users/${encodeURIComponent(user.id)}/reset-password`,
+            { method: "POST" }
+          );
+          setNotice(response.message);
+          setConfirmDialog(null);
+        } catch (error) {
+          setNotice(error.message);
+        } finally {
+          setLoading(false);
+        }
+      },
+    });
+  };
+
+  const renderRequests = () => {
+    const pendingCount = passwordResetRequests.filter((item) => item.status === "pending").length;
+    return (
+      <>
+        <div className="page-toolbar">
+          <div>
+            <h2>Yêu cầu đặt lại mật khẩu</h2>
+            <p>{pendingCount} yêu cầu đang chờ Admin xử lý</p>
+          </div>
+          <button className="secondary-button" onClick={loadPasswordResetRequests} disabled={requestsLoading}>
+            {requestsLoading ? "Đang tải..." : "↻ Làm mới"}
+          </button>
+        </div>
+
+        <div className="table-card">
+          <table>
+            <thead>
+              <tr>
+                <th>NGƯỜI DÙNG</th>
+                <th>THỜI GIAN GỬI</th>
+                <th>TRẠNG THÁI</th>
+                <th>XỬ LÝ</th>
+              </tr>
+            </thead>
+            <tbody>
+              {passwordResetRequests.length ? passwordResetRequests.map((item) => (
+                <tr key={item.id}>
+                  <td>
+                    <strong>{item.username || item.userID}</strong>
+                    <div className="muted">{item.fullName || item.userID}</div>
+                  </td>
+                  <td>{item.requestedAt ? new Date(item.requestedAt).toLocaleString("vi-VN") : "-"}</td>
+                  <td>
+                    <span className={`request-status ${item.status}`}>
+                      {item.status === "pending" ? "Chờ xử lý" : item.status === "approved" ? "Đã chấp nhận" : "Đã từ chối"}
+                    </span>
+                  </td>
+                  <td>
+                    {item.status === "pending" ? (
+                      <div className="request-actions">
+                        <button className="primary-button" onClick={() => reviewPasswordResetRequest(item, "approve")} disabled={loading}>
+                          Chấp nhận
+                        </button>
+                        <button className="danger-button" onClick={() => reviewPasswordResetRequest(item, "reject")} disabled={loading}>
+                          Từ chối
+                        </button>
+                      </div>
+                    ) : (
+                      <span className="muted">Đã xử lý</span>
+                    )}
+                  </td>
+                </tr>
+              )) : (
+                <tr><td colSpan="4" className="empty">Chưa có yêu cầu đặt lại mật khẩu</td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </>
+    );
+  };
 
   /*
    * =====================================================
@@ -2036,168 +2284,134 @@ useEffect(() => {
     }
   };
 
-  const renderSettings =
-    () => (
-      <>
-        <div className="page-toolbar">
-          <div>
-            <h2>
-              Hệ thống
-            </h2>
-
-            <p>
-              Thông tin kết nối Hyperledger
-              Fabric và ChainLaunch
-            </p>
+  const renderPermissions = () => (
+    <>
+      <div className="page-toolbar">
+        <div>
+          <h2>Phân quyền</h2>
+          <p>Quản lý quyền thao tác theo từng vai trò người dùng</p>
+        </div>
+      </div>
+      {permissionConfig && (
+        <div className="settings-card permission-settings-card">
+          <h3>Ma trận phân quyền theo vai trò</h3>
+          <p className="muted">
+            Tích chọn quyền cho từng vai trò rồi lưu thay đổi. Admin luôn có toàn quyền và không thể chỉnh sửa.
+          </p>
+          <div className="permission-matrix-scroll">
+            <table className="permission-matrix">
+              <thead>
+                <tr>
+                  <th className="permission-role-column">Vai trò người dùng</th>
+                  {Object.entries(PERMISSION_LABELS).map(([permission, label]) => (
+                    <th className="permission-column" key={permission} scope="col">{label}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {ROLE_PERMISSION_ORDER.map(({ role, abbreviation }) => {
+                  const isAdminRole = role === "admin";
+                  const selected = permissionConfig.permissions?.[role] || [];
+                  return (
+                    <tr className={isAdminRole ? "permission-admin-row" : ""} key={role}>
+                      <th className="permission-role-column" scope="row">
+                        <span>{ROLE_LABELS[role]}</span>
+                        <small>{abbreviation}</small>
+                      </th>
+                      {Object.entries(PERMISSION_LABELS).map(([permission, label]) => (
+                        <td className="permission-cell" key={permission}>
+                          <label title={`${ROLE_LABELS[role]} — ${label}`}>
+                            <input
+                              type="checkbox"
+                              checked={isAdminRole || selected.includes(permission)}
+                              disabled={isAdminRole || loading}
+                              onChange={() => toggleRolePermission(role, permission)}
+                              aria-label={`${ROLE_LABELS[role]}: ${label}`}
+                            />
+                          </label>
+                        </td>
+                      ))}
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+          <div className="permission-matrix-actions">
+            <span className="muted">Cuộn ngang để xem toàn bộ quyền.</span>
+            <button className="primary-button" onClick={savePermissions} disabled={loading}>
+              {loading ? "Đang lưu..." : "Lưu phân quyền"}
+            </button>
           </div>
         </div>
+      )}
+    </>
+  );
 
+  const renderSettings = () => (
+    <>
+      <div className="page-toolbar">
+        <div>
+          <h2>Cài đặt</h2>
+          <p>{isAdmin ? "Thông tin hệ thống và giao diện" : "Thông tin cá nhân và giao diện"}</p>
+        </div>
+      </div>
 
-        <div className="settings-card">
-          <Setting
-            label="Blockchain"
-            value="Hyperledger Fabric"
-            status={backend}
-          />
-
-          <Setting
-            label="Kết nối ChainLaunch"
-            value="Thông qua Backend API"
-          />
-
-          <Setting
-            label="Backend API"
-            value={API_URL}
-          />
-
-          <Setting
-            label="Tài khoản hiện tại"
-            value={currentUser?.username || "-"}
-          />
-
-          {isCustomer && can("update_own_contact") && (
-            <div className="setting-row">
-              <div>
-                <strong>SĐT/email</strong>
-                <div className="muted" style={{ marginTop: "4px" }}>
-                  {currentUser?.contact || "Chưa cập nhật"}
-                </div>
-              </div>
-              <button
-                className="secondary-button"
-                onClick={() => {
-                  setEditingUser({ ...currentUser, canEdit: true });
-                  setModal("user");
-                }}
-              >
-                Sửa SĐT/email
-              </button>
-            </div>
-          )}
-
+      <div className="settings-card">
+        {isAdmin ? (
+          <>
+            <Setting label="Blockchain" value="Hyperledger Fabric" status={backend} />
+            <Setting label="Kết nối ChainLaunch" value="Thông qua Backend API" />
+            <Setting label="Backend API" value={API_URL} />
+            <Setting label="Tài khoản hiện tại" value={currentUser?.username || "-"} />
+          </>
+        ) : (
           <div className="setting-row">
             <div>
-              <strong>Giao diện</strong>
+              <strong>SĐT/email</strong>
               <div className="muted" style={{ marginTop: "4px" }}>
-                Chọn sáng, tối hoặc tự động theo hệ thống
+                {currentUser?.contact || "Chưa cập nhật"}
               </div>
             </div>
-
-            <select
-              value={themeMode}
-              onChange={(event) => setThemeMode(event.target.value)}
-              style={{
-                minWidth: "180px",
-                padding: "10px 12px",
-                borderRadius: "8px",
+            <button
+              className="secondary-button"
+              onClick={() => {
+                setEditingUser({ ...currentUser, canEdit: true });
+                setModal("user");
               }}
             >
-              <option value="system">Theo hệ thống</option>
-              <option value="light">Sáng</option>
-              <option value="dark">Tối</option>
-            </select>
-          </div>
-
-
-          <button
-            className="secondary-button"
-            onClick={loadAll}
-          >
-            ↻ Làm mới kết nối
-          </button>
-
-
-          <pre>
-            {network
-              ? JSON.stringify(
-                  network,
-                  null,
-                  2
-                )
-              : "Chưa có dữ liệu Network từ Backend"}
-          </pre>
-        </div>
-
-        {isAdmin && permissionConfig && (
-          <div className="settings-card permission-settings-card" style={{ marginTop: "20px" }}>
-            <h3>Phân quyền theo vai trò</h3>
-            <p className="muted">
-              Tích chọn quyền cho từng vai trò rồi lưu thay đổi. Admin luôn có toàn quyền và không thể chỉnh sửa.
-            </p>
-
-            <div className="permission-matrix-scroll">
-              <table className="permission-matrix">
-                <thead>
-                  <tr>
-                    <th className="permission-role-column">Vai trò người dùng</th>
-                    {Object.entries(PERMISSION_LABELS).map(([permission, label]) => (
-                      <th className="permission-column" key={permission} scope="col">
-                        {label}
-                      </th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  {ROLE_PERMISSION_ORDER.map(({ role, abbreviation }) => {
-                    const isAdminRole = role === "admin";
-                    const selected = permissionConfig.permissions?.[role] || [];
-
-                    return (
-                      <tr className={isAdminRole ? "permission-admin-row" : ""} key={role}>
-                        <th className="permission-role-column" scope="row">
-                          <span>{ROLE_LABELS[role]}</span>
-                          <small>{abbreviation}</small>
-                        </th>
-                        {Object.entries(PERMISSION_LABELS).map(([permission, label]) => (
-                          <td className="permission-cell" key={permission}>
-                            <label title={`${ROLE_LABELS[role]} — ${label}`}>
-                              <input
-                                type="checkbox"
-                                checked={isAdminRole || selected.includes(permission)}
-                                disabled={isAdminRole || loading}
-                                onChange={() => toggleRolePermission(role, permission)}
-                                aria-label={`${ROLE_LABELS[role]}: ${label}`}
-                              />
-                            </label>
-                          </td>
-                        ))}
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
-
-            <div className="permission-matrix-actions">
-              <span className="muted">Cuộn ngang để xem toàn bộ quyền.</span>
-              <button className="primary-button" onClick={savePermissions} disabled={loading}>
-                {loading ? "Đang lưu..." : "Lưu phân quyền"}
-              </button>
-            </div>
+              Sửa SĐT/email
+            </button>
           </div>
         )}
-      </>
-    );
+
+        <div className="setting-row">
+          <div>
+            <strong>Giao diện</strong>
+            <div className="muted" style={{ marginTop: "4px" }}>
+              Chọn sáng, tối hoặc tự động theo hệ thống
+            </div>
+          </div>
+          <select
+            value={themeMode}
+            onChange={(event) => setThemeMode(event.target.value)}
+            style={{ minWidth: "180px", padding: "10px 12px", borderRadius: "8px" }}
+          >
+            <option value="system">Theo hệ thống</option>
+            <option value="light">Sáng</option>
+            <option value="dark">Tối</option>
+          </select>
+        </div>
+
+        {isAdmin && (
+          <>
+            <button className="secondary-button" onClick={loadAll}>↻ Làm mới kết nối</button>
+            <pre>{network ? JSON.stringify(network, null, 2) : "Chưa có dữ liệu Network từ Backend"}</pre>
+          </>
+        )}
+      </div>
+    </>
+  );
 
 
   /*
@@ -2321,13 +2535,41 @@ useEffect(() => {
             {loginLoading ? "Đang xác thực..." : "Đăng nhập"}
           </button>
 
+          <button
+            className="forgot-password-button"
+            type="button"
+            disabled={loginLoading}
+            onClick={sendPasswordResetRequest}
+          >
+            Quên mật khẩu?
+          </button>
         </form>
+
+        <ConfirmModal
+          dialog={confirmDialog}
+          onClose={() => setConfirmDialog(null)}
+        />
 
         <NoticeModal
           message={notice}
           onClose={() => setNotice("")}
         />
       </div>
+      </>
+    );
+  }
+
+  if (currentUser.mustChangePassword) {
+    return (
+      <>
+        <style>{THEME_STYLES}</style>
+        <PasswordChangeScreen
+          username={currentUser.username}
+          loading={loading}
+          onSave={changeCurrentPassword}
+          onLogout={logout}
+        />
+        <NoticeModal message={notice} onClose={() => setNotice("")} />
       </>
     );
   }
@@ -2376,6 +2618,8 @@ useEffect(() => {
             ["assets", "▤", isWarehouse ? "Sản phẩm trong kho" : "Tài sản"],
             ...(canManageUsers ? [["users", "♙", "Nhân sự & khách hàng"]] : []),
             ...(can("view_history") ? [["transactions", "◷", "Lịch sử giao dịch"]] : []),
+            ...(isAdmin ? [["requests", "✉", `Yêu cầu${pendingResetCount ? ` (${pendingResetCount})` : ""}`]] : []),
+            ...(isAdmin ? [["permissions", "✓", "Phân quyền"]] : []),
           ].map(
             ([
               key,
@@ -2494,6 +2738,12 @@ useEffect(() => {
                   transactions:
                     "Lịch sử giao dịch",
 
+                  requests:
+                    "Yêu cầu",
+
+                  permissions:
+                    "Phân quyền",
+
                   settings:
                     "Cài đặt",
                 }[page]
@@ -2554,6 +2804,12 @@ useEffect(() => {
           {page === "transactions" &&
             renderTransactions()}
 
+          {page === "requests" && isAdmin &&
+            renderRequests()}
+
+          {page === "permissions" && isAdmin &&
+            renderPermissions()}
+
           {page === "settings" &&
             renderSettings()}
 
@@ -2588,8 +2844,9 @@ useEffect(() => {
         <UserModal
           roles={creatableRoles}
           initial={editingUser}
-          contactOnly={isCustomer && editingUser?.id === currentUser?.id}
+          contactOnly={!isAdmin && editingUser?.id === currentUser?.id}
           allowRoleEdit={isAdmin}
+          onResetPassword={isAdmin && editingUser?.id !== currentUser?.id ? requestAdminResetPassword : null}
           onClose={() => {
             setEditingUser(null);
             setModal(null);
@@ -3055,6 +3312,87 @@ function NoticeModal({ message, onClose }) {
           OK
         </button>
       </div>
+    </div>
+  );
+}
+
+
+function PasswordChangeScreen({ username, loading, onSave, onLogout }) {
+  const [form, setForm] = useState({
+    currentPassword: "",
+    newPassword: "",
+    confirmPassword: "",
+  });
+  const [formError, setFormError] = useState("");
+
+  const submit = (event) => {
+    event.preventDefault();
+    if (form.newPassword.length < 8) {
+      setFormError("Mật khẩu mới phải có ít nhất 8 ký tự");
+      return;
+    }
+    if (form.newPassword !== form.confirmPassword) {
+      setFormError("Xác nhận mật khẩu mới không khớp");
+      return;
+    }
+    setFormError("");
+    onSave(form);
+  };
+
+  return (
+    <div className="assetchain-login-page password-change-page">
+      <form className="assetchain-login-card password-change-card" onSubmit={submit}>
+        <div className="password-change-brand">
+          <div className="logo-icon">🛡</div>
+          <div>
+            <div className="logo-title">AssetChain</div>
+            <div className="logo-subtitle">Bảo mật tài khoản</div>
+          </div>
+        </div>
+        <h1>Đổi mật khẩu lần đầu</h1>
+        <p className="muted">
+          Tài khoản <strong>{username}</strong> phải đổi mật khẩu trước khi sử dụng hệ thống.
+        </p>
+        <label>
+          Mật khẩu hiện tại
+          <input
+            required
+            type="password"
+            autoComplete="current-password"
+            value={form.currentPassword}
+            onChange={(event) => setForm({ ...form, currentPassword: event.target.value })}
+          />
+        </label>
+        <label>
+          Mật khẩu mới
+          <input
+            required
+            minLength={8}
+            type="password"
+            autoComplete="new-password"
+            value={form.newPassword}
+            onChange={(event) => setForm({ ...form, newPassword: event.target.value })}
+          />
+        </label>
+        <label>
+          Xác nhận mật khẩu mới
+          <input
+            required
+            minLength={8}
+            type="password"
+            autoComplete="new-password"
+            value={form.confirmPassword}
+            onChange={(event) => setForm({ ...form, confirmPassword: event.target.value })}
+          />
+        </label>
+        {formError && <div className="form-error">{formError}</div>}
+        <button className="primary-button" disabled={loading}>
+          {loading ? "Đang cập nhật..." : "Đổi mật khẩu"}
+        </button>
+        <button type="button" className="secondary-button" onClick={onLogout} disabled={loading}>
+          Quay lại đăng nhập
+        </button>
+      </form>
     </div>
   );
 }
@@ -3831,6 +4169,7 @@ function UserModal({
   initial,
   contactOnly,
   allowRoleEdit,
+  onResetPassword,
   onClose,
   onSave,
 }) {
@@ -3898,18 +4237,9 @@ function UserModal({
                     onChange={(event) => setForm({ ...form, username: event.target.value })}
                   />
                 </label>
-                <label>
-                  Password
-                  <input
-                    required
-                    type="password"
-                    minLength={8}
-                    autoComplete="new-password"
-                    value={form.password}
-                    placeholder="Tối thiểu 8 ký tự"
-                    onChange={(event) => setForm({ ...form, password: event.target.value })}
-                  />
-                </label>
+                <div className="default-password-note">
+                  Mật khẩu ban đầu: <strong>12345678</strong>. Người dùng phải đổi mật khẩu khi đăng nhập lần đầu.
+                </div>
               </>
             )}
 
@@ -3928,6 +4258,16 @@ function UserModal({
               </select>
             </label>
           </>
+        )}
+
+        {isEdit && onResetPassword && (
+          <button
+            type="button"
+            className="danger-button reset-password-button"
+            onClick={() => onResetPassword(initial)}
+          >
+            Đặt lại mật khẩu mặc định
+          </button>
         )}
 
         <div className="modal-actions">
@@ -4058,7 +4398,9 @@ function TransferModal({
                 <input placeholder="SĐT/email (để trống sẽ dùng user_STT)" value={customerForm.contact} onChange={(event) => setCustomerForm({ ...customerForm, contact: event.target.value })} />
                 <input required placeholder="Username" value={customerForm.username} onChange={(event) => setCustomerForm({ ...customerForm, username: event.target.value })} />
                 <input required placeholder="Họ và tên" value={customerForm.fullName} onChange={(event) => setCustomerForm({ ...customerForm, fullName: event.target.value })} />
-                <input required minLength={8} type="password" placeholder="Password tối thiểu 8 ký tự" value={customerForm.password} onChange={(event) => setCustomerForm({ ...customerForm, password: event.target.value })} />
+                <div className="default-password-note">
+                  Mật khẩu ban đầu: <strong>12345678</strong>; khách hàng phải đổi khi đăng nhập lần đầu.
+                </div>
               </div>
             )}
           </>

@@ -2,8 +2,10 @@ import os
 import json
 import requests
 from collections import defaultdict, deque
+from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
+from secrets import token_urlsafe
 from threading import Lock
 from time import monotonic
 
@@ -52,6 +54,10 @@ AUTH_CREDENTIALS_FILE = os.getenv("AUTH_CREDENTIALS_FILE")
 ROLE_PERMISSIONS_FILE = os.getenv("ROLE_PERMISSIONS_FILE") or str(
     Path(__file__).with_name("role-permissions.local.json")
 )
+AUTH_STATE_FILE = os.getenv("AUTH_STATE_FILE") or str(
+    Path(__file__).with_name("auth-state.local.json")
+)
+DEFAULT_INITIAL_PASSWORD = os.getenv("DEFAULT_INITIAL_PASSWORD", "12345678")
 
 ROLE_ALIASES = {"user": "customer"}
 ROLE_LABELS = {
@@ -80,6 +86,7 @@ LOGIN_FAILURE_LIMIT = int(os.getenv("LOGIN_FAILURE_LIMIT", "8"))
 LOGIN_FAILURE_WINDOW = int(os.getenv("LOGIN_FAILURE_WINDOW", "600"))
 login_failures = defaultdict(deque)
 login_failures_lock = Lock()
+auth_state_lock = Lock()
 
 FABRIC_CHAINCODE_ID = os.getenv(
     "FABRIC_CHAINCODE_ID",
@@ -355,6 +362,174 @@ def save_role_permissions(permissions):
     return normalized
 
 
+def empty_auth_state():
+    return {
+        "knownUserIDs": [],
+        "mustChangeUserIDs": [],
+        "sessionVersions": {},
+        "passwordResetRequests": [],
+    }
+
+
+def load_auth_state_unlocked():
+    state = empty_auth_state()
+    try:
+        configured = json.loads(Path(AUTH_STATE_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return state
+    if not isinstance(configured, dict):
+        return state
+    for key in ("knownUserIDs", "mustChangeUserIDs", "passwordResetRequests"):
+        if isinstance(configured.get(key), list):
+            state[key] = configured[key]
+    if isinstance(configured.get("sessionVersions"), dict):
+        state["sessionVersions"] = configured["sessionVersions"]
+    return state
+
+
+def save_auth_state_unlocked(state):
+    path = Path(AUTH_STATE_FILE)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, path)
+
+
+def auth_state_snapshot():
+    with auth_state_lock:
+        return load_auth_state_unlocked()
+
+
+def register_first_login(user_id):
+    user_id = str(user_id or "").strip()
+    if not user_id:
+        return False
+    with auth_state_lock:
+        state = load_auth_state_unlocked()
+        known = {str(value) for value in state["knownUserIDs"]}
+        must_change = {str(value) for value in state["mustChangeUserIDs"]}
+        if user_id not in known:
+            known.add(user_id)
+            must_change.add(user_id)
+            state["knownUserIDs"] = sorted(known)
+            state["mustChangeUserIDs"] = sorted(must_change)
+            save_auth_state_unlocked(state)
+        return user_id in must_change
+
+
+def password_change_required(user_id):
+    user_id = str(user_id or "").strip()
+    if not user_id:
+        return False
+    state = auth_state_snapshot()
+    return user_id in {str(value) for value in state["mustChangeUserIDs"]}
+
+
+def session_version(user_id):
+    state = auth_state_snapshot()
+    try:
+        return int(state["sessionVersions"].get(str(user_id), 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def update_password_state(user_id, must_change):
+    user_id = str(user_id or "").strip()
+    with auth_state_lock:
+        state = load_auth_state_unlocked()
+        known = {str(value) for value in state["knownUserIDs"]}
+        pending = {str(value) for value in state["mustChangeUserIDs"]}
+        known.add(user_id)
+        if must_change:
+            pending.add(user_id)
+        else:
+            pending.discard(user_id)
+        try:
+            next_version = int(state["sessionVersions"].get(user_id, 0)) + 1
+        except (TypeError, ValueError):
+            next_version = 1
+        state["knownUserIDs"] = sorted(known)
+        state["mustChangeUserIDs"] = sorted(pending)
+        state["sessionVersions"][user_id] = next_version
+        save_auth_state_unlocked(state)
+        return next_version
+
+
+def add_password_reset_request(user):
+    now = datetime.now(timezone.utc).isoformat()
+    user_id = str(user.get("id", ""))
+    with auth_state_lock:
+        state = load_auth_state_unlocked()
+        for item in state["passwordResetRequests"]:
+            if str(item.get("userID")) == user_id and item.get("status") == "pending":
+                return item
+        item = {
+            "id": token_urlsafe(12),
+            "userID": user_id,
+            "username": str(user.get("username", "")),
+            "fullName": str(user.get("fullName", "")),
+            "status": "pending",
+            "requestedAt": now,
+        }
+        state["passwordResetRequests"].append(item)
+        save_auth_state_unlocked(state)
+        return item
+
+
+def update_password_reset_request(request_id, status, reviewer_id):
+    with auth_state_lock:
+        state = load_auth_state_unlocked()
+        selected = None
+        for item in state["passwordResetRequests"]:
+            if item.get("id") == request_id:
+                selected = item
+                break
+        if selected is None:
+            return None
+        selected["status"] = status
+        selected["reviewedAt"] = datetime.now(timezone.utc).isoformat()
+        selected["reviewedBy"] = str(reviewer_id or "")
+        save_auth_state_unlocked(state)
+        return selected
+
+
+def get_user_by_username(username):
+    result = invoke_chaincode("GetUserByUsername", [str(username)])
+    user = parse_chaincode_result(result)
+    if result.get("success") and isinstance(user, dict):
+        return user
+    users_result = invoke_chaincode("GetAllUsers", [])
+    users = parse_chaincode_result(users_result)
+    if users_result.get("success") and isinstance(users, list):
+        normalized = str(username).strip().lower()
+        return next(
+            (
+                candidate for candidate in users
+                if str(candidate.get("username", "")).strip().lower() == normalized
+            ),
+            None,
+        )
+    return None
+
+
+def set_user_password_to_default(user_id):
+    user_result = invoke_chaincode("GetUser", [str(user_id)])
+    user = parse_chaincode_result(user_result)
+    if not user_result.get("success") or not isinstance(user, dict):
+        return None, "Người dùng không tồn tại"
+    if normalize_role(user.get("role")) == "store":
+        return None, "Không thể đặt mật khẩu cho tài khoản hệ thống"
+    reset_result = invoke_chaincode(
+        "SetUserPassword",
+        [str(user_id), generate_password_hash(DEFAULT_INITIAL_PASSWORD)],
+    )
+    if not reset_result.get("success"):
+        return None, "Không thể đặt lại mật khẩu trên Blockchain"
+    update_password_state(user_id, must_change=True)
+    return user, None
+
+
 def can_view_asset(identity, asset):
     if has_permission(identity, "view_all_assets"):
         return True
@@ -421,7 +596,78 @@ def read_chaincode_asset(asset_id):
     return asset if isinstance(asset, dict) else None, result
 
 
-def require_auth(admin_only=False, permission=None):
+def user_reference(user_id, directory):
+    user_id = str(user_id or "")
+    if not user_id:
+        return None
+    if user_id == STORE_USER_ID:
+        return {"id": STORE_USER_ID, "username": "store", "fullName": "Kho cửa hàng"}
+    user = directory.get(user_id, {})
+    return {
+        "id": user_id,
+        "username": str(user.get("username") or user_id),
+        "fullName": str(user.get("fullName") or user.get("username") or user_id),
+    }
+
+
+def enrich_asset_history(history):
+    users_result = invoke_chaincode("GetAllUsers", [])
+    users = parse_chaincode_result(users_result)
+    directory = {
+        str(user.get("id")): user
+        for user in (users if isinstance(users, list) else [])
+        if isinstance(user, dict) and user.get("id")
+    }
+    enriched = []
+    previous_owner_id = ""
+    for index, original in enumerate(history):
+        record = dict(original) if isinstance(original, dict) else {"value": original}
+        value = record.get("value") or record.get("Value") or {}
+        if not isinstance(value, dict):
+            value = {}
+        is_delete = bool(record.get("isDelete") or record.get("IsDelete"))
+        current_owner_id = str(value.get("ownerID") or value.get("OwnerID") or "")
+        actor_id = str(value.get("lastActorID") or value.get("LastActorID") or "")
+        from_owner_id = ""
+        to_owner_id = current_owner_id
+        if is_delete:
+            from_owner_id = previous_owner_id
+            to_owner_id = ""
+        elif previous_owner_id and current_owner_id != previous_owner_id:
+            from_owner_id = previous_owner_id
+        elif (
+            index == 0
+            and str(value.get("status") or value.get("Status") or "").strip().lower() == "sold"
+            and current_owner_id not in {"", STORE_USER_ID, ADMIN_OWNER_ID}
+        ):
+            # Tài sản tách ra khi bán một phần có lịch sử bắt đầu tại bản ghi đã bán.
+            from_owner_id = STORE_USER_ID
+
+        if is_delete:
+            operation = "delete"
+        elif from_owner_id and to_owner_id and from_owner_id != to_owner_id:
+            operation = "transfer"
+        elif index == 0:
+            operation = "create"
+        else:
+            operation = "update"
+
+        record.update({
+            "operation": operation,
+            "actorID": actor_id,
+            "actor": user_reference(actor_id, directory),
+            "fromOwnerID": from_owner_id,
+            "fromOwner": user_reference(from_owner_id, directory),
+            "toOwnerID": to_owner_id,
+            "toOwner": user_reference(to_owner_id, directory),
+        })
+        enriched.append(record)
+        if not is_delete and current_owner_id:
+            previous_owner_id = current_owner_id
+    return enriched
+
+
+def require_auth(admin_only=False, permission=None, allow_password_change=False):
     def decorator(handler):
         @wraps(handler)
         def wrapped(*args, **kwargs):
@@ -437,6 +683,23 @@ def require_auth(admin_only=False, permission=None):
                     "status": "error",
                     "message": "Phiên đăng nhập không hợp lệ hoặc đã hết hạn"
                 }), 401
+            user_id = str(identity.get("id", ""))
+            try:
+                token_version = int(identity.get("version", 0))
+            except (TypeError, ValueError):
+                token_version = -1
+            if token_version != session_version(user_id):
+                return jsonify({
+                    "status": "error",
+                    "code": "SESSION_REVOKED",
+                    "message": "Phiên đăng nhập đã hết hiệu lực. Vui lòng đăng nhập lại"
+                }), 401
+            if password_change_required(user_id) and not allow_password_change:
+                return jsonify({
+                    "status": "error",
+                    "code": "PASSWORD_CHANGE_REQUIRED",
+                    "message": "Bạn phải đổi mật khẩu trước khi tiếp tục"
+                }), 428
             if admin_only and normalize_role(identity.get("role")) != "admin":
                 return jsonify({
                     "status": "error",
@@ -485,21 +748,7 @@ def login():
             "message": "Username hoặc password không đúng"
         }), 401
 
-    user_result = invoke_chaincode("GetUserByUsername", [username])
-    user = parse_chaincode_result(user_result)
-    if not user_result.get("success") or not isinstance(user, dict):
-        users_result = invoke_chaincode("GetAllUsers", [])
-        users = parse_chaincode_result(users_result)
-        if users_result.get("success") and isinstance(users, list):
-            normalized_username = username.lower()
-            user = next(
-                (
-                    candidate for candidate in users
-                    if str(candidate.get("username", "")).strip().lower()
-                    == normalized_username
-                ),
-                None,
-            )
+    user = get_user_by_username(username)
     if not isinstance(user, dict):
         record_login_failure(attempt_key)
         return jsonify({
@@ -509,11 +758,15 @@ def login():
 
     clear_login_failures(attempt_key)
     user["role"] = normalize_role(user.get("role")).upper()
+    user_id = str(user.get("id", ""))
+    must_change_password = register_first_login(user_id)
+    user["mustChangePassword"] = must_change_password
 
     try:
         token = auth_serializer().dumps({
-            "id": user.get("id"),
-            "role": user.get("role")
+            "id": user_id,
+            "role": user.get("role"),
+            "version": session_version(user_id),
         })
     except RuntimeError as error:
         return jsonify({"status": "error", "message": str(error)}), 503
@@ -521,6 +774,154 @@ def login():
     return jsonify({
         "status": "success",
         "data": {"user": user, "token": token}
+    })
+
+
+@app.route("/api/auth/password-reset-requests", methods=["POST"])
+def request_password_reset():
+    body = request.get_json(silent=True) or {}
+    username = str(body.get("username", "")).strip()
+    if not username:
+        return jsonify({
+            "status": "error",
+            "message": "Vui lòng nhập username trước khi gửi yêu cầu"
+        }), 400
+
+    user = get_user_by_username(username)
+    if isinstance(user, dict) and normalize_role(user.get("role")) != "store":
+        add_password_reset_request(user)
+
+    # Luôn trả cùng một thông báo để không làm lộ username có tồn tại hay không.
+    return jsonify({
+        "status": "success",
+        "message": "Nếu username tồn tại, yêu cầu đã được gửi đến Admin"
+    })
+
+
+@app.route("/api/auth/change-password", methods=["POST"])
+@require_auth(allow_password_change=True)
+def change_password():
+    body = request.get_json(silent=True) or {}
+    current_password = str(body.get("currentPassword", ""))
+    new_password = str(body.get("newPassword", ""))
+    if not current_password or not new_password:
+        return jsonify({
+            "status": "error",
+            "message": "Mật khẩu hiện tại và mật khẩu mới là bắt buộc"
+        }), 400
+    if len(new_password) < 8:
+        return jsonify({
+            "status": "error",
+            "message": "Mật khẩu mới phải có ít nhất 8 ký tự"
+        }), 400
+    if new_password == DEFAULT_INITIAL_PASSWORD:
+        return jsonify({
+            "status": "error",
+            "message": "Mật khẩu mới không được trùng mật khẩu mặc định"
+        }), 400
+    if new_password == current_password:
+        return jsonify({
+            "status": "error",
+            "message": "Mật khẩu mới phải khác mật khẩu hiện tại"
+        }), 400
+
+    user_id = str(request.auth_user.get("id", ""))
+    user_result = invoke_chaincode("GetUser", [user_id])
+    user = parse_chaincode_result(user_result)
+    if not user_result.get("success") or not isinstance(user, dict):
+        return jsonify({"status": "error", "message": "Người dùng không tồn tại"}), 404
+
+    username = str(user.get("username", ""))
+    credential_result = invoke_chaincode("GetPasswordHash", [username])
+    password_hash = parse_chaincode_result(credential_result)
+    if not credential_result.get("success") or not isinstance(password_hash, str):
+        password_hash = configured_password_hash(username)
+    if not isinstance(password_hash, str) or not check_password_hash(password_hash, current_password):
+        return jsonify({
+            "status": "error",
+            "message": "Mật khẩu hiện tại không đúng"
+        }), 401
+
+    updated = invoke_chaincode(
+        "SetUserPassword", [user_id, generate_password_hash(new_password)]
+    )
+    if not updated.get("success"):
+        return jsonify({
+            "status": "error",
+            "message": "Không thể cập nhật mật khẩu trên Blockchain",
+            "fabric_response": updated,
+        }), 500
+
+    version = update_password_state(user_id, must_change=False)
+    token = auth_serializer().dumps({
+        "id": user_id,
+        "role": request.auth_user.get("role"),
+        "version": version,
+    })
+    user["role"] = normalize_role(user.get("role")).upper()
+    user["mustChangePassword"] = False
+    return jsonify({
+        "status": "success",
+        "message": "Đổi mật khẩu thành công",
+        "data": {"user": user, "token": token},
+    })
+
+
+@app.route("/api/password-reset-requests", methods=["GET"])
+@require_auth(admin_only=True)
+def get_password_reset_requests():
+    items = list(auth_state_snapshot()["passwordResetRequests"])
+    items.sort(key=lambda item: str(item.get("requestedAt", "")), reverse=True)
+    return jsonify({"status": "success", "data": items})
+
+
+@app.route("/api/password-reset-requests/<request_id>/<decision>", methods=["POST"])
+@require_auth(admin_only=True)
+def review_password_reset_request(request_id, decision):
+    if decision not in {"approve", "reject"}:
+        return jsonify({"status": "error", "message": "Quyết định không hợp lệ"}), 400
+    state = auth_state_snapshot()
+    selected = next(
+        (item for item in state["passwordResetRequests"] if item.get("id") == request_id),
+        None,
+    )
+    if selected is None:
+        return jsonify({"status": "error", "message": "Yêu cầu không tồn tại"}), 404
+    if selected.get("status") != "pending":
+        return jsonify({"status": "error", "message": "Yêu cầu này đã được xử lý"}), 409
+
+    status = "rejected"
+    if decision == "approve":
+        _, error = set_user_password_to_default(selected.get("userID"))
+        if error:
+            return jsonify({"status": "error", "message": error}), 500
+        status = "approved"
+    updated = update_password_reset_request(
+        request_id, status, request.auth_user.get("id")
+    )
+    return jsonify({
+        "status": "success",
+        "message": "Đã chấp nhận yêu cầu và đặt mật khẩu về mặc định"
+        if status == "approved" else "Đã từ chối yêu cầu",
+        "data": updated,
+    })
+
+
+@app.route("/api/users/<user_id>/reset-password", methods=["POST"])
+@require_auth(admin_only=True)
+def admin_reset_user_password(user_id):
+    if str(user_id) == str(request.auth_user.get("id")):
+        return jsonify({
+            "status": "error",
+            "message": "Admin không thể tự đặt lại mật khẩu bằng chức năng quản trị"
+        }), 400
+    user, error = set_user_password_to_default(user_id)
+    if error:
+        return jsonify({"status": "error", "message": error}), 500
+    return jsonify({
+        "status": "success",
+        "message": "Đã đặt mật khẩu về mặc định; người dùng phải đổi mật khẩu khi đăng nhập",
+        "data": {"id": user.get("id"), "username": user.get("username")},
     })
 
 
@@ -1017,11 +1418,12 @@ def asset_history(asset_id):
     history = parse_chaincode_result(result)
     if not isinstance(history, list):
         history = []
+    history = enrich_asset_history(history)
     if normalize_role(request.auth_user.get("role")) == "warehouse":
         actor_id = str(request.auth_user.get("id"))
         history = [
             record for record in history
-            if str((record.get("value") or {}).get("lastActorID")) == actor_id
+            if str(record.get("actorID")) == actor_id
         ]
 
     return jsonify({
@@ -1099,7 +1501,6 @@ def create_user():
 
     required_fields = [
         "username",
-        "password",
         "fullName",
         "role"
     ]
@@ -1112,12 +1513,6 @@ def create_user():
                 "status": "error",
                 "message": f"Thiếu trường {field}"
             }), 400
-
-    if len(str(body["password"])) < 8:
-        return jsonify({
-            "status": "error",
-            "message": "Password phải có ít nhất 8 ký tự"
-        }), 400
 
     creator_role = normalize_role(request.auth_user.get("role"))
     requested_role = normalize_role(body.get("role"))
@@ -1154,7 +1549,7 @@ def create_user():
             str(body["username"]),
             str(body["fullName"]),
             requested_role.upper(),
-            generate_password_hash(str(body["password"])),
+            generate_password_hash(DEFAULT_INITIAL_PASSWORD),
             contact,
             str(request.auth_user.get("id", ""))
         ]
@@ -1176,6 +1571,7 @@ def create_user():
         "contact": contact,
         "createdBy": str(request.auth_user.get("id", "")),
     }
+    update_password_state(user_id, must_change=True)
     response_user = public_user_for_identity(request.auth_user, created_user)
     if creator_role == "sales":
         response_user = {
@@ -1185,7 +1581,7 @@ def create_user():
         }
     return jsonify({
         "status": "success",
-        "message": "Tạo người dùng thành công",
+        "message": "Tạo người dùng thành công với mật khẩu mặc định",
         "data": response_user or created_user,
         "fabric_response": result["data"]
     })
@@ -1203,7 +1599,10 @@ def update_user(user_id):
     actor_role = normalize_role(request.auth_user.get("role"))
     target_role = normalize_role(user.get("role"))
     is_self = str(user_id) == str(request.auth_user.get("id"))
-    if actor_role == "admin":
+    is_contact_only = bool(body) and set(body) <= {"contact"}
+    if is_self and is_contact_only:
+        allowed = True
+    elif actor_role == "admin":
         allowed = True
     elif actor_role == "manager":
         allowed = has_permission(request.auth_user, "update_user") and target_role not in {"admin", "store"}
@@ -1214,10 +1613,10 @@ def update_user(user_id):
     if not allowed:
         return jsonify({"status": "error", "message": "Không có quyền sửa người dùng này"}), 403
 
-    if actor_role == "customer":
+    if actor_role != "admin" and is_self:
         unexpected = set(body) - {"contact"}
         if unexpected:
-            return jsonify({"status": "error", "message": "Khách hàng chỉ được sửa SĐT/email"}), 403
+            return jsonify({"status": "error", "message": "Bạn chỉ được sửa SĐT/email của chính mình"}), 403
 
     full_name = str(body.get("fullName", user.get("fullName", ""))).strip()
     contact = str(body.get("contact", user.get("contact", ""))).strip()
@@ -1279,7 +1678,7 @@ def delete_user(user_id):
 # ==========================================
 
 @app.route("/api/fabric/networks", methods=["GET"])
-@require_auth()
+@require_auth(admin_only=True)
 def fabric_networks():
 
     result = fabric_request(

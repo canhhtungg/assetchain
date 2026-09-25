@@ -5,3 +5,4 @@ __pycache__/
 *.pyc
 credentials*.json
 role-permissions*.json
+auth-state*.json

@@ -14,11 +14,15 @@ class AuthenticationApiTest(unittest.TestCase):
         self.previous_secret = backend.APP_SECRET
         self.previous_credentials_file = backend.AUTH_CREDENTIALS_FILE
         self.previous_permissions_file = backend.ROLE_PERMISSIONS_FILE
+        self.previous_auth_state_file = backend.AUTH_STATE_FILE
         self.permissions_directory = tempfile.TemporaryDirectory()
         backend.APP_SECRET = "test-only-secret"
         backend.AUTH_CREDENTIALS_FILE = None
         backend.ROLE_PERMISSIONS_FILE = os.path.join(
             self.permissions_directory.name, "permissions.json"
+        )
+        backend.AUTH_STATE_FILE = os.path.join(
+            self.permissions_directory.name, "auth-state.json"
         )
         backend.login_failures.clear()
         backend.app.config.update(TESTING=True)
@@ -28,6 +32,7 @@ class AuthenticationApiTest(unittest.TestCase):
         backend.APP_SECRET = self.previous_secret
         backend.AUTH_CREDENTIALS_FILE = self.previous_credentials_file
         backend.ROLE_PERMISSIONS_FILE = self.previous_permissions_file
+        backend.AUTH_STATE_FILE = self.previous_auth_state_file
         backend.login_failures.clear()
         self.permissions_directory.cleanup()
 
@@ -76,7 +81,9 @@ class AuthenticationApiTest(unittest.TestCase):
         payload = response.get_json()["data"]
         self.assertEqual(payload["user"]["username"], "admin")
         self.assertTrue(payload["token"])
-        self.assertNotIn("password", json.dumps(payload["user"]).lower())
+        self.assertNotIn("passwordHash", payload["user"])
+        self.assertNotIn("password", payload["user"])
+        self.assertTrue(payload["user"]["mustChangePassword"])
 
     @patch("app.invoke_chaincode")
     def test_login_rejects_wrong_password_without_user_enumeration(self, invoke):
@@ -155,6 +162,94 @@ class AuthenticationApiTest(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json()["data"]["user"]["id"], "U001")
+
+    @patch("app.invoke_chaincode")
+    def test_forgot_password_creates_pending_request_without_exposing_lookup(self, invoke):
+        invoke.return_value = {
+            "success": True,
+            "data": {
+                "result": {
+                    "id": "C001",
+                    "username": "customer1",
+                    "fullName": "Customer One",
+                    "role": "CUSTOMER",
+                }
+            },
+        }
+        response = self.client.post(
+            "/api/auth/password-reset-requests",
+            json={"username": "customer1"},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Nếu username tồn tại", response.get_json()["message"])
+        requests = backend.auth_state_snapshot()["passwordResetRequests"]
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0]["userID"], "C001")
+        self.assertEqual(requests[0]["status"], "pending")
+
+    @patch("app.invoke_chaincode")
+    def test_admin_approves_password_reset_to_default_and_requires_change(self, invoke):
+        request_item = backend.add_password_reset_request({
+            "id": "C001",
+            "username": "customer1",
+            "fullName": "Customer One",
+        })
+        invoke.side_effect = [
+            {
+                "success": True,
+                "data": {"result": {"id": "C001", "username": "customer1", "role": "CUSTOMER"}},
+            },
+            {"success": True, "data": {"result": {}}},
+        ]
+        token = backend.auth_serializer().dumps({"id": "U001", "role": "ADMIN", "version": 0})
+        response = self.client.post(
+            f"/api/password-reset-requests/{request_item['id']}/approve",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(response.status_code, 200)
+        password_hash = invoke.call_args_list[1].args[1][1]
+        self.assertTrue(backend.check_password_hash(password_hash, "12345678"))
+        self.assertTrue(backend.password_change_required("C001"))
+        self.assertEqual(response.get_json()["data"]["status"], "approved")
+
+    @patch("app.invoke_chaincode")
+    def test_required_user_can_change_password_and_receives_new_session(self, invoke):
+        version = backend.update_password_state("C001", must_change=True)
+        token = backend.auth_serializer().dumps({
+            "id": "C001", "role": "CUSTOMER", "version": version
+        })
+        invoke.side_effect = [
+            {
+                "success": True,
+                "data": {"result": {"id": "C001", "username": "customer1", "role": "CUSTOMER"}},
+            },
+            {
+                "success": True,
+                "data": {"result": generate_password_hash("12345678")},
+            },
+            {"success": True, "data": {"result": {}}},
+        ]
+        response = self.client.post(
+            "/api/auth/change-password",
+            json={"currentPassword": "12345678", "newPassword": "new-password-123"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(backend.password_change_required("C001"))
+        self.assertFalse(response.get_json()["data"]["user"]["mustChangePassword"])
+        self.assertTrue(response.get_json()["data"]["token"])
+
+    def test_required_user_is_blocked_from_other_protected_endpoints(self):
+        version = backend.update_password_state("C001", must_change=True)
+        token = backend.auth_serializer().dumps({
+            "id": "C001", "role": "CUSTOMER", "version": version
+        })
+        response = self.client.get(
+            "/api/permissions/me",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(response.status_code, 428)
+        self.assertEqual(response.get_json()["code"], "PASSWORD_CHANGE_REQUIRED")
 
     def test_chaincode_proxy_requires_a_session(self):
         response = self.client.post(
