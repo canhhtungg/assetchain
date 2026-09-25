@@ -40,6 +40,16 @@ class AuthenticationApiTest(unittest.TestCase):
         response = self.client.post("/api/auth/login", json={"username": "admin"})
         self.assertEqual(response.status_code, 400)
 
+    def test_api_responses_include_security_headers(self):
+        response = self.client.get("/api/health")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["X-Content-Type-Options"], "nosniff")
+        self.assertEqual(response.headers["X-Frame-Options"], "DENY")
+        self.assertEqual(response.headers["Referrer-Policy"], "no-referrer")
+        self.assertIn("frame-ancestors 'none'", response.headers["Content-Security-Policy"])
+        self.assertIn("max-age=31536000", response.headers["Strict-Transport-Security"])
+        self.assertEqual(response.headers["Cache-Control"], "no-store")
+
     def test_parse_chaincode_result_handles_chainlaunch_envelope(self):
         result = {
             "data": {
