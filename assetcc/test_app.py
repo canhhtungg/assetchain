@@ -25,6 +25,7 @@ class AuthenticationApiTest(unittest.TestCase):
             self.permissions_directory.name, "auth-state.json"
         )
         backend.login_failures.clear()
+        backend.password_reset_attempts.clear()
         backend.app.config.update(TESTING=True)
         self.client = backend.app.test_client()
 
@@ -34,6 +35,7 @@ class AuthenticationApiTest(unittest.TestCase):
         backend.ROLE_PERMISSIONS_FILE = self.previous_permissions_file
         backend.AUTH_STATE_FILE = self.previous_auth_state_file
         backend.login_failures.clear()
+        backend.password_reset_attempts.clear()
         self.permissions_directory.cleanup()
 
     def test_login_requires_username_and_password(self):
@@ -68,6 +70,14 @@ class AuthenticationApiTest(unittest.TestCase):
         self.assertEqual(accepted.headers["X-Request-ID"], "report-123")
         replaced = self.client.get("/api/health", headers={"X-Request-ID": "invalid request id"})
         self.assertNotEqual(replaced.headers["X-Request-ID"], "invalid request id")
+
+    def test_oversized_request_is_rejected(self):
+        response = self.client.post(
+            "/api/auth/login",
+            data="x" * (backend.app.config["MAX_CONTENT_LENGTH"] + 1),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 413)
 
     def test_runtime_secret_prefers_systemd_credential(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -228,6 +238,25 @@ class AuthenticationApiTest(unittest.TestCase):
         self.assertEqual(len(requests), 1)
         self.assertEqual(requests[0]["userID"], "C001")
         self.assertEqual(requests[0]["status"], "pending")
+
+    @patch("app.invoke_chaincode")
+    def test_forgot_password_is_rate_limited(self, invoke):
+        invoke.return_value = {"success": False}
+        for _ in range(backend.PASSWORD_RESET_REQUEST_LIMIT):
+            response = self.client.post(
+                "/api/auth/password-reset-requests", json={"username": "unknown"}
+            )
+            self.assertEqual(response.status_code, 200)
+        blocked = self.client.post(
+            "/api/auth/password-reset-requests", json={"username": "unknown"}
+        )
+        self.assertEqual(blocked.status_code, 429)
+
+    def test_password_policy_requires_length_variety_and_excludes_username(self):
+        self.assertIn("12 ký tự", backend.password_policy_error("Short1!"))
+        self.assertIn("3 nhóm", backend.password_policy_error("alllowercase12"))
+        self.assertIn("username", backend.password_policy_error("Admin-Strong-123", "admin"))
+        self.assertEqual(backend.password_policy_error("Strong-Access-2026!", "customer"), "")
 
     @patch("app.invoke_chaincode")
     def test_admin_approves_password_reset_to_default_and_requires_change(self, invoke):

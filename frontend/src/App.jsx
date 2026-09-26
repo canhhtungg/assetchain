@@ -3327,8 +3327,8 @@ function PasswordChangeScreen({ username, loading, onSave, onLogout }) {
 
   const submit = (event) => {
     event.preventDefault();
-    if (form.newPassword.length < 8) {
-      setFormError("Mật khẩu mới phải có ít nhất 8 ký tự");
+    if (form.newPassword.length < 12) {
+      setFormError("Mật khẩu mới phải có ít nhất 12 ký tự");
       return;
     }
     if (form.newPassword !== form.confirmPassword) {
@@ -3367,7 +3367,7 @@ function PasswordChangeScreen({ username, loading, onSave, onLogout }) {
           Mật khẩu mới
           <input
             required
-            minLength={8}
+            minLength={12}
             type="password"
             autoComplete="new-password"
             value={form.newPassword}
@@ -3378,7 +3378,7 @@ function PasswordChangeScreen({ username, loading, onSave, onLogout }) {
           Xác nhận mật khẩu mới
           <input
             required
-            minLength={8}
+            minLength={12}
             type="password"
             autoComplete="new-password"
             value={form.confirmPassword}

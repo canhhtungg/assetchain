@@ -35,6 +35,7 @@ def runtime_secret(name):
 # ==========================================
 
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = int(os.getenv("MAX_REQUEST_BYTES", "65536"))
 
 audit_logger = logging.getLogger("assetchain.audit")
 audit_logger.setLevel(logging.INFO)
@@ -99,6 +100,15 @@ def assign_request_id():
         g.request_id = supplied
     else:
         g.request_id = token_urlsafe(12)
+
+
+@app.errorhandler(413)
+def request_too_large(_error):
+    audit_event("request.rejected", "rejected", details={"reason": "payload_too_large"})
+    return jsonify({
+        "status": "error",
+        "message": "Dữ liệu gửi lên vượt quá giới hạn cho phép",
+    }), 413
 
 ALLOWED_ORIGINS = [
     origin.strip()
@@ -181,8 +191,12 @@ STORE_USER_ID = "STORE"
 ADMIN_OWNER_ID = os.getenv("ADMIN_OWNER_ID", "U001")
 LOGIN_FAILURE_LIMIT = int(os.getenv("LOGIN_FAILURE_LIMIT", "8"))
 LOGIN_FAILURE_WINDOW = int(os.getenv("LOGIN_FAILURE_WINDOW", "600"))
+PASSWORD_RESET_REQUEST_LIMIT = int(os.getenv("PASSWORD_RESET_REQUEST_LIMIT", "5"))
+PASSWORD_RESET_REQUEST_WINDOW = int(os.getenv("PASSWORD_RESET_REQUEST_WINDOW", "600"))
 login_failures = defaultdict(deque)
 login_failures_lock = Lock()
+password_reset_attempts = defaultdict(deque)
+password_reset_attempts_lock = Lock()
 auth_state_lock = Lock()
 
 FABRIC_CHAINCODE_ID = os.getenv(
@@ -390,6 +404,50 @@ def record_login_failure(key):
 def clear_login_failures(key):
     with login_failures_lock:
         login_failures.pop(key, None)
+
+
+def record_password_reset_attempt(key):
+    now = monotonic()
+    cutoff = now - PASSWORD_RESET_REQUEST_WINDOW
+    with password_reset_attempts_lock:
+        attempts = password_reset_attempts[key]
+        while attempts and attempts[0] < cutoff:
+            attempts.popleft()
+        if len(attempts) >= PASSWORD_RESET_REQUEST_LIMIT:
+            return False
+        if len(password_reset_attempts) > 5000:
+            password_reset_attempts.clear()
+            attempts = password_reset_attempts[key]
+        attempts.append(now)
+        return True
+
+
+COMMON_PASSWORDS = {
+    "12345678", "123456789", "password", "password123", "qwerty123",
+    "admin123", "letmein", "welcome123",
+}
+
+
+def password_policy_error(password, username=""):
+    if len(password) < 12:
+        return "Mật khẩu mới phải có ít nhất 12 ký tự"
+    if len(password) > 128:
+        return "Mật khẩu mới không được vượt quá 128 ký tự"
+    normalized = password.casefold()
+    if normalized in COMMON_PASSWORDS:
+        return "Mật khẩu mới quá phổ biến"
+    normalized_username = str(username or "").strip().casefold()
+    if len(normalized_username) >= 4 and normalized_username in normalized:
+        return "Mật khẩu mới không được chứa username"
+    character_groups = sum((
+        any(character.islower() for character in password),
+        any(character.isupper() for character in password),
+        any(character.isdigit() for character in password),
+        any(not character.isalnum() for character in password),
+    ))
+    if character_groups < 3:
+        return "Mật khẩu mới phải kết hợp ít nhất 3 nhóm: chữ thường, chữ hoa, số, ký tự đặc biệt"
+    return ""
 
 
 def configured_password_hash(username):
@@ -922,6 +980,16 @@ def request_password_reset():
             "message": "Vui lòng nhập username trước khi gửi yêu cầu"
         }), 400
 
+    if not record_password_reset_attempt(login_attempt_key(username)):
+        audit_event(
+            "password_reset.request", "rate_limited",
+            details={"username": username.lower()},
+        )
+        return jsonify({
+            "status": "error",
+            "message": "Đã gửi quá nhiều yêu cầu. Vui lòng thử lại sau",
+        }), 429
+
     user = get_user_by_username(username)
     if isinstance(user, dict) and normalize_role(user.get("role")) != "store":
         add_password_reset_request(user)
@@ -953,11 +1021,6 @@ def change_password():
             "status": "error",
             "message": "Mật khẩu hiện tại và mật khẩu mới là bắt buộc"
         }), 400
-    if len(new_password) < 8:
-        return jsonify({
-            "status": "error",
-            "message": "Mật khẩu mới phải có ít nhất 8 ký tự"
-        }), 400
     if new_password == DEFAULT_INITIAL_PASSWORD:
         return jsonify({
             "status": "error",
@@ -976,6 +1039,13 @@ def change_password():
         return jsonify({"status": "error", "message": "Người dùng không tồn tại"}), 404
 
     username = str(user.get("username", ""))
+    policy_error = password_policy_error(new_password, username)
+    if policy_error:
+        audit_event(
+            "password.change", "rejected", user_id, request.auth_user.get("role"),
+            target_id=user_id, details={"reason": "password_policy"},
+        )
+        return jsonify({"status": "error", "message": policy_error}), 400
     credential_result = invoke_chaincode("GetPasswordHash", [username])
     password_hash = parse_chaincode_result(credential_result)
     if not credential_result.get("success") or not isinstance(password_hash, str):
