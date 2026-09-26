@@ -1,5 +1,6 @@
 import os
 import json
+import logging
 import requests
 from collections import defaultdict, deque
 from datetime import datetime, timezone
@@ -9,7 +10,7 @@ from secrets import token_urlsafe
 from threading import Lock
 from time import monotonic
 
-from flask import Flask, request, jsonify
+from flask import Flask, g, has_request_context, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
@@ -34,6 +35,70 @@ def runtime_secret(name):
 # ==========================================
 
 app = Flask(__name__)
+
+audit_logger = logging.getLogger("assetchain.audit")
+audit_logger.setLevel(logging.INFO)
+if not audit_logger.handlers:
+    audit_handler = logging.StreamHandler()
+    audit_handler.setFormatter(logging.Formatter("AUDIT %(message)s"))
+    audit_logger.addHandler(audit_handler)
+audit_logger.propagate = False
+
+AUDIT_REDACTED_KEYS = {
+    "authorization", "cookie", "password", "passwordhash", "secret", "token"
+}
+
+
+def audit_clean(value, key=""):
+    normalized_key = str(key).replace("_", "").lower()
+    if any(redacted in normalized_key for redacted in AUDIT_REDACTED_KEYS):
+        return "[REDACTED]"
+    if isinstance(value, dict):
+        return {str(item_key): audit_clean(item_value, item_key) for item_key, item_value in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [audit_clean(item) for item in value]
+    if isinstance(value, str):
+        return value[:256]
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return str(value)[:256]
+
+
+def request_client_ip():
+    if not has_request_context():
+        return ""
+    forwarded_for = request.headers.get("X-Forwarded-For", "").split(",", 1)[0].strip()
+    return forwarded_for or request.remote_addr or "unknown"
+
+
+def audit_event(event, outcome, actor_id=None, actor_role=None, target_id=None, details=None):
+    entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "event": str(event),
+        "outcome": str(outcome),
+        "actorID": str(actor_id or ""),
+        "actorRole": normalize_role(actor_role) if actor_role else "",
+        "targetID": str(target_id or ""),
+    }
+    if has_request_context():
+        entry.update({
+            "requestID": getattr(g, "request_id", ""),
+            "clientIP": request_client_ip(),
+            "method": request.method,
+            "path": request.path,
+        })
+    if details:
+        entry["details"] = audit_clean(details)
+    audit_logger.info(json.dumps(entry, ensure_ascii=False, separators=(",", ":")))
+
+
+@app.before_request
+def assign_request_id():
+    supplied = request.headers.get("X-Request-ID", "").strip()
+    if supplied and len(supplied) <= 64 and all(character.isalnum() or character in "-_." for character in supplied):
+        g.request_id = supplied
+    else:
+        g.request_id = token_urlsafe(12)
 
 ALLOWED_ORIGINS = [
     origin.strip()
@@ -63,6 +128,7 @@ def add_security_headers(response):
     if request.path.startswith("/api/"):
         response.headers.setdefault("Cache-Control", "no-store")
         response.headers.setdefault("Pragma", "no-cache")
+    response.headers.setdefault("X-Request-ID", getattr(g, "request_id", ""))
     return response
 
 
@@ -301,9 +367,7 @@ def auth_serializer():
 
 
 def login_attempt_key(username):
-    forwarded_for = request.headers.get("X-Forwarded-For", "").split(",", 1)[0].strip()
-    client_address = forwarded_for or request.remote_addr or "unknown"
-    return f"{client_address}:{username.strip().lower()}"
+    return f"{request_client_ip()}:{username.strip().lower()}"
 
 
 def login_is_rate_limited(key):
@@ -704,12 +768,14 @@ def require_auth(admin_only=False, permission=None, allow_password_change=False)
         def wrapped(*args, **kwargs):
             header = request.headers.get("Authorization", "")
             if not header.startswith("Bearer "):
+                audit_event("authorization.denied", "denied", details={"reason": "missing_token"})
                 return jsonify({"status": "error", "message": "Chưa đăng nhập"}), 401
             try:
                 identity = auth_serializer().loads(
                     header[7:], max_age=AUTH_TOKEN_MAX_AGE
                 )
             except (BadSignature, SignatureExpired, RuntimeError):
+                audit_event("authorization.denied", "denied", details={"reason": "invalid_or_expired_token"})
                 return jsonify({
                     "status": "error",
                     "message": "Phiên đăng nhập không hợp lệ hoặc đã hết hạn"
@@ -720,23 +786,39 @@ def require_auth(admin_only=False, permission=None, allow_password_change=False)
             except (TypeError, ValueError):
                 token_version = -1
             if token_version != session_version(user_id):
+                audit_event(
+                    "authorization.denied", "denied", user_id, identity.get("role"),
+                    details={"reason": "session_revoked"},
+                )
                 return jsonify({
                     "status": "error",
                     "code": "SESSION_REVOKED",
                     "message": "Phiên đăng nhập đã hết hiệu lực. Vui lòng đăng nhập lại"
                 }), 401
             if password_change_required(user_id) and not allow_password_change:
+                audit_event(
+                    "authorization.denied", "denied", user_id, identity.get("role"),
+                    details={"reason": "password_change_required"},
+                )
                 return jsonify({
                     "status": "error",
                     "code": "PASSWORD_CHANGE_REQUIRED",
                     "message": "Bạn phải đổi mật khẩu trước khi tiếp tục"
                 }), 428
             if admin_only and normalize_role(identity.get("role")) != "admin":
+                audit_event(
+                    "authorization.denied", "denied", user_id, identity.get("role"),
+                    details={"reason": "admin_required"},
+                )
                 return jsonify({
                     "status": "error",
                     "message": "Chỉ Admin mới có quyền thực hiện thao tác này"
                 }), 403
             if permission and not has_permission(identity, permission):
+                audit_event(
+                    "authorization.denied", "denied", user_id, identity.get("role"),
+                    details={"reason": "missing_permission", "permission": permission},
+                )
                 return jsonify({
                     "status": "error",
                     "message": "Vai trò hiện tại không có quyền thực hiện thao tác này"
@@ -753,6 +835,7 @@ def login():
     username = str(body.get("username", "")).strip()
     password = str(body.get("password", ""))
     if not username or not password:
+        audit_event("authentication.login", "rejected", details={"reason": "missing_credentials"})
         return jsonify({
             "status": "error",
             "message": "Username và password là bắt buộc"
@@ -760,6 +843,10 @@ def login():
 
     attempt_key = login_attempt_key(username)
     if login_is_rate_limited(attempt_key):
+        audit_event(
+            "authentication.login", "rate_limited",
+            details={"username": username.lower()},
+        )
         return jsonify({
             "status": "error",
             "message": "Đăng nhập tạm thời bị giới hạn. Vui lòng thử lại sau"
@@ -774,6 +861,10 @@ def login():
         or not check_password_hash(password_hash, password)
     ):
         record_login_failure(attempt_key)
+        audit_event(
+            "authentication.login", "failure",
+            details={"username": username.lower(), "reason": "invalid_credentials"},
+        )
         return jsonify({
             "status": "error",
             "message": "Username hoặc password không đúng"
@@ -782,6 +873,10 @@ def login():
     user = get_user_by_username(username)
     if not isinstance(user, dict):
         record_login_failure(attempt_key)
+        audit_event(
+            "authentication.login", "failure",
+            details={"username": username.lower(), "reason": "user_not_found"},
+        )
         return jsonify({
             "status": "error",
             "message": "Username hoặc password không đúng"
@@ -800,7 +895,16 @@ def login():
             "version": session_version(user_id),
         })
     except RuntimeError as error:
+        audit_event(
+            "authentication.login", "error", user_id, user.get("role"),
+            details={"reason": "token_signing_unavailable"},
+        )
         return jsonify({"status": "error", "message": str(error)}), 503
+
+    audit_event(
+        "authentication.login", "success", user_id, user.get("role"),
+        details={"mustChangePassword": must_change_password},
+    )
 
     return jsonify({
         "status": "success",
@@ -821,6 +925,15 @@ def request_password_reset():
     user = get_user_by_username(username)
     if isinstance(user, dict) and normalize_role(user.get("role")) != "store":
         add_password_reset_request(user)
+        audit_event(
+            "password_reset.request", "accepted", target_id=user.get("id"),
+            details={"username": user.get("username")},
+        )
+    else:
+        audit_event(
+            "password_reset.request", "ignored",
+            details={"username": username.lower(), "reason": "unknown_account"},
+        )
 
     # Luôn trả cùng một thông báo để không làm lộ username có tồn tại hay không.
     return jsonify({
@@ -868,6 +981,10 @@ def change_password():
     if not credential_result.get("success") or not isinstance(password_hash, str):
         password_hash = configured_password_hash(username)
     if not isinstance(password_hash, str) or not check_password_hash(password_hash, current_password):
+        audit_event(
+            "password.change", "failure", user_id, request.auth_user.get("role"),
+            target_id=user_id, details={"reason": "invalid_current_password"},
+        )
         return jsonify({
             "status": "error",
             "message": "Mật khẩu hiện tại không đúng"
@@ -891,6 +1008,9 @@ def change_password():
     })
     user["role"] = normalize_role(user.get("role")).upper()
     user["mustChangePassword"] = False
+    audit_event(
+        "password.change", "success", user_id, user.get("role"), target_id=user_id,
+    )
     return jsonify({
         "status": "success",
         "message": "Đổi mật khẩu thành công",
@@ -930,6 +1050,11 @@ def review_password_reset_request(request_id, decision):
     updated = update_password_reset_request(
         request_id, status, request.auth_user.get("id")
     )
+    audit_event(
+        "password_reset.review", status,
+        request.auth_user.get("id"), request.auth_user.get("role"),
+        selected.get("userID"), {"requestID": request_id},
+    )
     return jsonify({
         "status": "success",
         "message": "Đã chấp nhận yêu cầu và đặt mật khẩu về mặc định"
@@ -949,6 +1074,10 @@ def admin_reset_user_password(user_id):
     user, error = set_user_password_to_default(user_id)
     if error:
         return jsonify({"status": "error", "message": error}), 500
+    audit_event(
+        "password_reset.admin", "success",
+        request.auth_user.get("id"), request.auth_user.get("role"), user_id,
+    )
     return jsonify({
         "status": "success",
         "message": "Đã đặt mật khẩu về mặc định; người dùng phải đổi mật khẩu khi đăng nhập",
@@ -977,6 +1106,11 @@ def update_permissions():
         permissions = save_role_permissions(body.get("permissions", {}))
     except ValueError as error:
         return jsonify({"status": "error", "message": str(error)}), 400
+    audit_event(
+        "authorization.permissions_update", "success",
+        request.auth_user.get("id"), request.auth_user.get("role"),
+        details={"roles": sorted(permissions)},
+    )
     return jsonify({"status": "success", "data": permissions})
 
 
@@ -1010,6 +1144,11 @@ def authenticated_chaincode_invoke():
             "message": "Function và args hợp lệ là bắt buộc"
         }), 400
     if function in blocked_functions:
+        audit_event(
+            "chaincode.direct_invoke", "denied",
+            request.auth_user.get("id"), request.auth_user.get("role"),
+            details={"function": function},
+        )
         return jsonify({
             "status": "error",
             "message": "Hàm chaincode này không được phép gọi trực tiếp"
@@ -1603,6 +1742,11 @@ def create_user():
         "createdBy": str(request.auth_user.get("id", "")),
     }
     update_password_state(user_id, must_change=True)
+    audit_event(
+        "user.create", "success",
+        request.auth_user.get("id"), request.auth_user.get("role"), user_id,
+        {"targetRole": requested_role},
+    )
     response_user = public_user_for_identity(request.auth_user, created_user)
     if creator_role == "sales":
         response_user = {
@@ -1642,6 +1786,10 @@ def update_user(user_id):
     else:
         allowed = is_self and has_permission(request.auth_user, "update_own_contact")
     if not allowed:
+        audit_event(
+            "user.update", "denied", request.auth_user.get("id"),
+            request.auth_user.get("role"), user_id,
+        )
         return jsonify({"status": "error", "message": "Không có quyền sửa người dùng này"}), 403
 
     if actor_role != "admin" and is_self:
@@ -1678,6 +1826,11 @@ def update_user(user_id):
     if not updated.get("success"):
         return jsonify({"status": "error", "message": "Không thể cập nhật người dùng", "fabric_response": updated}), 500
     user.update({"fullName": full_name, "role": role.upper(), "contact": contact})
+    audit_event(
+        "user.update", "success", request.auth_user.get("id"),
+        request.auth_user.get("role"), user_id,
+        {"roleChanged": role != target_role, "contactOnly": is_contact_only},
+    )
     return jsonify({"status": "success", "message": "Cập nhật người dùng thành công", "data": user})
 
 
@@ -1698,6 +1851,10 @@ def delete_user(user_id):
             "fabric_response": result
         }), 409
 
+    audit_event(
+        "user.delete", "success", request.auth_user.get("id"),
+        request.auth_user.get("role"), user_id,
+    )
     return jsonify({
         "status": "success",
         "message": "Xóa người dùng thành công"

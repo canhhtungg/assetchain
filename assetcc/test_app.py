@@ -49,6 +49,25 @@ class AuthenticationApiTest(unittest.TestCase):
         self.assertIn("frame-ancestors 'none'", response.headers["Content-Security-Policy"])
         self.assertIn("max-age=31536000", response.headers["Strict-Transport-Security"])
         self.assertEqual(response.headers["Cache-Control"], "no-store")
+        self.assertTrue(response.headers["X-Request-ID"])
+
+    def test_audit_log_is_structured_and_redacts_secrets(self):
+        with self.assertLogs("assetchain.audit", level="INFO") as captured:
+            backend.audit_event(
+                "security.test", "success", "U001", "ADMIN", "U002",
+                {"password": "do-not-log", "token": "do-not-log-either", "field": "safe"},
+            )
+        rendered = "\n".join(captured.output)
+        self.assertIn('"event":"security.test"', rendered)
+        self.assertIn('"field":"safe"', rendered)
+        self.assertIn("[REDACTED]", rendered)
+        self.assertNotIn("do-not-log", rendered)
+
+    def test_client_request_id_is_validated_and_returned(self):
+        accepted = self.client.get("/api/health", headers={"X-Request-ID": "report-123"})
+        self.assertEqual(accepted.headers["X-Request-ID"], "report-123")
+        replaced = self.client.get("/api/health", headers={"X-Request-ID": "invalid request id"})
+        self.assertNotEqual(replaced.headers["X-Request-ID"], "invalid request id")
 
     def test_runtime_secret_prefers_systemd_credential(self):
         with tempfile.TemporaryDirectory() as directory:
