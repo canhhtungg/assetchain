@@ -327,7 +327,7 @@ useEffect(() => {
           return updated;
         });
       }
-      if (data.code === "SESSION_REVOKED") {
+      if (response.status === 401 || data.code === "SESSION_REVOKED") {
         localStorage.removeItem("assetchain-session");
         setCurrentUser(null);
         setAuthToken("");
