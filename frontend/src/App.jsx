@@ -2264,7 +2264,7 @@ useEffect(() => {
           }}
         >
           <div style={{ display: "flex", alignItems: "center", gap: "14px", marginBottom: "28px" }}>
-            <div className="logo-icon">AC</div>
+            <div className="logo-icon"><img src={`${import.meta.env.BASE_URL}favicon.svg`} alt="AssetChain" /></div>
             <div>
               <div className="logo-title" style={{ color: "#111827" }}>AssetChain</div>
               <div className="logo-subtitle" style={{ color: "#6b7280" }}>Blockchain Management</div>
@@ -2401,7 +2401,7 @@ useEffect(() => {
 
         <div className="logo">
 
-          <div className="logo-icon">AC</div>
+          <div className="logo-icon"><img src={`${import.meta.env.BASE_URL}favicon.svg`} alt="AssetChain" /></div>
 
           <div>
 
@@ -3154,7 +3154,7 @@ function PasswordChangeScreen({ username, loading, onSave, onLogout }) {
     <div className="assetchain-login-page password-change-page">
       <form className="assetchain-login-card password-change-card" onSubmit={submit}>
         <div className="password-change-brand">
-          <div className="logo-icon">AC</div>
+          <div className="logo-icon"><img src={`${import.meta.env.BASE_URL}favicon.svg`} alt="AssetChain" /></div>
           <div>
             <div className="logo-title">AssetChain</div>
             <div className="logo-subtitle">Bảo mật tài khoản</div>
