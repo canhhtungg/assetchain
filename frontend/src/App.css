@@ -431,7 +431,7 @@ select:focus, input:focus, textarea:focus { border-color: rgba(184,255,97,.48); 
   .app { display: block; padding: 10px; }
   .sidebar { position: fixed; z-index: 20; top: auto; right: 10px; bottom: 10px; left: 10px; width: auto; height: 68px; padding: 8px; border-radius: 20px; }
   .sidebar .logo, .sidebar .menu-title, .sidebar-bottom { display: none; }
-  .sidebar nav { display: flex; gap: 5px; overflow-x: auto; padding-right: 56px; scrollbar-width: none; }
+  .sidebar nav { width: calc(100% - 58px); display: flex; gap: 5px; overflow-x: auto; padding-right: 0; scrollbar-width: none; }
   .sidebar nav::-webkit-scrollbar { display: none; }
   .menu-item { min-width: 49px; height: 49px; flex: 0 0 49px; margin: 0; border-radius: 14px; }
   .sidebar > .menu-item { position: absolute; right: 8px; bottom: 8px; }
