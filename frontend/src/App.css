@@ -57,6 +57,7 @@ body {
 }
 button, input, select, textarea { font: inherit; }
 button { color: inherit; }
+.ui-icon { display: block; flex: 0 0 auto; }
 button:disabled { cursor: not-allowed; opacity: .5; }
 ::selection { background: rgba(184, 255, 97, .26); }
 
@@ -131,8 +132,8 @@ button:disabled { cursor: not-allowed; opacity: .5; }
   border-radius: 10px;
   background: rgba(255, 255, 255, .045);
   color: #aeb5c8;
-  font-size: 15px;
 }
+.menu-icon .ui-icon { width: 16px; height: 16px; }
 .menu-item.active .menu-icon { background: var(--lime); color: #0e1608; box-shadow: 0 8px 24px rgba(184, 255, 97, .18); }
 .sidebar-bottom { margin-top: auto; padding-top: 16px; }
 .network-status {
@@ -186,7 +187,8 @@ button:disabled { cursor: not-allowed; opacity: .5; }
 .stat-card:hover::after { opacity: 1; transform: translate(0,0); color: var(--lime); }
 .stat-card:focus-visible { outline: 3px solid rgba(184,255,97,.34); outline-offset: 3px; }
 [data-assetchain-theme="light"] .stat-card:hover { background: #fff; border-color: #b7c4ad; box-shadow: 0 18px 42px rgba(45,62,31,.14); }
-.stat-icon { width: 40px; height: 40px; flex: 0 0 40px; display: grid; place-items: center; border-radius: 13px; color: #111; font-size: 18px; }
+.stat-icon { width: 40px; height: 40px; flex: 0 0 40px; display: grid; place-items: center; border-radius: 13px; color: #111; }
+.stat-icon .ui-icon { width: 19px; height: 19px; stroke-width: 2; }
 .stat-icon.blue { background: linear-gradient(145deg, #75ddff, #6498ff); }
 .stat-icon.green { background: linear-gradient(145deg, #d8ff8a, var(--lime)); }
 .stat-icon.purple { background: linear-gradient(145deg, #9a8cff, #6d6aff); color: #fff; }
@@ -207,7 +209,8 @@ button:disabled { cursor: not-allowed; opacity: .5; }
 .asset-type-card { position: relative; min-height: 90px; display: flex; align-items: center; gap: 13px; padding: 16px; overflow: hidden; border: 1px solid var(--line); border-radius: var(--radius-lg); background: var(--panel); }
 .asset-type-card::after { content: ""; position: absolute; inset: auto -30px -55px auto; width: 110px; height: 110px; border-radius: 50%; background: rgba(109,106,255,.08); }
 .asset-type-icon, .table-icon { display: grid; place-items: center; background: var(--panel-raised); }
-.asset-type-icon { width: 44px; height: 44px; flex: 0 0 44px; border-radius: 14px; font-size: 20px; }
+.asset-type-icon { width: 44px; height: 44px; flex: 0 0 44px; border-radius: 14px; color: var(--text); }
+.asset-type-icon .ui-icon { width: 20px; height: 20px; }
 .asset-type-card div:nth-child(2) { min-width: 0; display: flex; flex: 1; flex-direction: column; }
 .asset-type-card span { color: var(--muted); font-size: 10px; }
 .asset-type-card strong { margin-top: 1px; color: var(--text); font-size: 20px; font-weight: 800; }
@@ -242,7 +245,8 @@ tbody tr:hover td { background: rgba(255,255,255,.025); }
 .asset-name { display: flex; align-items: center; gap: 10px; }
 .asset-name strong { display: block; color: var(--text); font-size: 11px; }
 .asset-name span { display: block; margin-top: 2px; color: var(--subtle); font-size: 9px; }
-.table-icon { width: 34px; height: 34px; flex: 0 0 34px; border-radius: 11px; font-size: 16px; }
+.table-icon { width: 34px; height: 34px; flex: 0 0 34px; border-radius: 11px; color: var(--text); }
+.table-icon .ui-icon { width: 16px; height: 16px; }
 .type-badge, .status, .request-status { display: inline-flex; align-items: center; padding: 5px 9px; border-radius: 999px; font-size: 9px; font-weight: 750; white-space: nowrap; }
 .type-badge { background: rgba(109,106,255,.1); color: #aaa8ff; }
 .status.active, .request-status.approved { background: rgba(119,230,165,.1); color: var(--success); }
@@ -374,6 +378,11 @@ select:focus, input:focus, textarea:focus { border-color: rgba(184,255,97,.48); 
 .assetchain-login-card .logo-subtitle, .login-subtitle { color: var(--muted) !important; }
 .login-title { font-size: 27px; font-weight: 800; letter-spacing: -.7px; }
 .assetchain-login-card input { height: 52px !important; border-color: var(--line-strong) !important; border-radius: 13px !important; background: var(--bg-soft) !important; color: var(--text) !important; }
+.password-field { position: relative; width: 100%; }
+.password-field input { padding-right: 48px !important; }
+.password-toggle { position: absolute; top: 50%; right: 9px; width: 34px; height: 34px; display: grid; place-items: center; transform: translateY(-50%); border: 0; border-radius: 10px; background: transparent; color: var(--muted); cursor: pointer; transition: background .18s ease, color .18s ease; }
+.password-toggle:hover { background: var(--panel-hover); color: var(--text); }
+.password-toggle:focus-visible { outline: 2px solid rgba(184,255,97,.45); outline-offset: 1px; }
 .assetchain-login-card .primary-button { width: 100%; margin-top: 20px; }
 .forgot-password-button { width: 100%; margin-top: 14px; border: 0; background: transparent; color: var(--lime); font-size: 11px; font-weight: 700; cursor: pointer; }
 .password-change-brand { display: flex; align-items: center; gap: 14px; margin-bottom: 24px; }

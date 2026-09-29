@@ -51,14 +51,14 @@ const normalizeRole = (role) => {
 const iconFor = (type) =>
   (
     {
-      Computer: "💻",
-      Phone: "📱",
-      Vehicle: "🚗",
-      Other: "📦",
-      car: "🚗",
-      laptop: "💻",
-      phone: "📱",
-    }[type] || "📦"
+      Computer: "computer",
+      Phone: "phone",
+      Vehicle: "vehicle",
+      Other: "package",
+      car: "vehicle",
+      laptop: "computer",
+      phone: "phone",
+    }[type] || "package"
   );
 
 
@@ -1490,7 +1490,7 @@ useEffect(() => {
 
         <div className="stats">
           <Stat
-            icon="📦"
+            icon={<Icon name="package" />}
             tone="blue"
             label={isManager || isWarehouse ? "Tồn kho" : "Tổng tài sản"}
             value={isManager || isWarehouse ? inventoryQuantity : visibleAssets.length}
@@ -1499,7 +1499,7 @@ useEffect(() => {
           />
 
           <Stat
-            icon="👥"
+            icon={<Icon name="users" />}
             tone="green"
             label={isManager ? "Nhân viên" : isAdmin ? "Người dùng" : "Tài khoản"}
             value={isManager ? employees.length : isAdmin ? users.length : 1}
@@ -1509,7 +1509,7 @@ useEffect(() => {
 
           {isManager && (
             <Stat
-              icon="🛍"
+              icon={<Icon name="shop" />}
               tone="orange"
               label="Khách hàng"
               value={customers.length}
@@ -1519,7 +1519,7 @@ useEffect(() => {
           )}
 
           <Stat
-            icon="↗"
+            icon={<Icon name="trend" />}
             tone="purple"
             label="Giao dịch"
             value={visibleTransactions.length}
@@ -1528,7 +1528,7 @@ useEffect(() => {
           />
 
           <Stat
-            icon="🛡"
+            icon={<Icon name="blockchain" />}
             tone="orange"
             label="Blockchain"
             value={
@@ -1566,7 +1566,7 @@ useEffect(() => {
                 key={type}
               >
                 <div className="asset-type-icon">
-                  {iconFor(type)}
+                  <Icon name={iconFor(type)} />
                 </div>
 
                 <div>
@@ -2350,20 +2350,19 @@ useEffect(() => {
           </div>
 
           <div style={{ width: "100%", marginTop: "14px" }}>
-            <input
+            <PasswordField
               required
-              type="password"
               autoComplete="current-password"
               value={loginPassword}
               onChange={(event) => setLoginPassword(event.target.value)}
               placeholder="Nhập password"
-              aria-label="Password"
+              ariaLabel="Password"
               style={{
                 display: "block",
                 width: "100%",
                 height: "52px",
                 boxSizing: "border-box",
-                padding: "0 16px",
+                padding: "0 48px 0 16px",
                 border: "1px solid #d1d5db",
                 borderRadius: "10px",
                 background: "#f9fafb",
@@ -2460,12 +2459,12 @@ useEffect(() => {
 
         <nav>
           {[
-            ["dashboard", "▣", "Dashboard"],
-            ["assets", "▤", "Tài sản"],
-            ...(canAccessUsers ? [["users", "♙", "Nhân sự & người dùng"]] : []),
-            ...(can("view_history") ? [["transactions", "◷", "Lịch sử giao dịch"]] : []),
-            ...(isAdmin ? [["requests", "✉", `Yêu cầu${pendingResetCount ? ` (${pendingResetCount})` : ""}`]] : []),
-            ...(isAdmin ? [["permissions", "✓", "Phân quyền"]] : []),
+            ["dashboard", "dashboard", "Dashboard"],
+            ["assets", "package", "Tài sản"],
+            ...(canAccessUsers ? [["users", "users", "Nhân sự & người dùng"]] : []),
+            ...(can("view_history") ? [["transactions", "history", "Lịch sử giao dịch"]] : []),
+            ...(isAdmin ? [["requests", "mail", `Yêu cầu${pendingResetCount ? ` (${pendingResetCount})` : ""}`]] : []),
+            ...(isAdmin ? [["permissions", "shield-check", "Phân quyền"]] : []),
           ].map(
             ([
               key,
@@ -2484,7 +2483,7 @@ useEffect(() => {
                 }
               >
                 <span className="menu-icon">
-                  {icon}
+                  <Icon name={icon} />
                 </span>
 
                 <span>
@@ -2512,7 +2511,7 @@ useEffect(() => {
           }
         >
           <span className="menu-icon">
-            ⚙
+            <Icon name="settings" />
           </span>
 
           <span>
@@ -2743,9 +2742,7 @@ useEffect(() => {
 
 
               <div className="drawer-icon">
-                {iconFor(
-                  selected.type
-                )}
+                <Icon name={iconFor(selected.type)} />
               </div>
 
 
@@ -3201,34 +3198,34 @@ function PasswordChangeScreen({ username, initialCurrentPassword, loading, onSav
         </p>
         <label>
           Mật khẩu hiện tại
-          <input
+          <PasswordField
             required
-            type="password"
             autoComplete="current-password"
             value={form.currentPassword}
             onChange={(event) => setForm({ ...form, currentPassword: event.target.value })}
+            ariaLabel="Mật khẩu hiện tại"
           />
         </label>
         <label>
           Mật khẩu mới
-          <input
+          <PasswordField
             required
             minLength={12}
-            type="password"
             autoComplete="new-password"
             value={form.newPassword}
             onChange={(event) => setForm({ ...form, newPassword: event.target.value })}
+            ariaLabel="Mật khẩu mới"
           />
         </label>
         <label>
           Xác nhận mật khẩu mới
-          <input
+          <PasswordField
             required
             minLength={12}
-            type="password"
             autoComplete="new-password"
             value={form.confirmPassword}
             onChange={(event) => setForm({ ...form, confirmPassword: event.target.value })}
+            ariaLabel="Xác nhận mật khẩu mới"
           />
         </label>
         {formError && <div className="form-error">{formError}</div>}
@@ -3249,6 +3246,52 @@ function PasswordChangeScreen({ username, initialCurrentPassword, loading, onSav
  * COMPONENTS
  * =====================================================
  */
+
+
+function Icon({ name, size = 18 }) {
+  const paths = {
+    dashboard: <><rect x="3" y="3" width="7" height="7" rx="2"/><rect x="14" y="3" width="7" height="7" rx="2"/><rect x="3" y="14" width="7" height="7" rx="2"/><rect x="14" y="14" width="7" height="7" rx="2"/></>,
+    package: <><path d="m4 7 8-4 8 4-8 4-8-4Z"/><path d="m4 7 8 4 8-4v10l-8 4-8-4V7Z"/><path d="M12 11v10"/></>,
+    users: <><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></>,
+    history: <><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5M12 7v5l3 2"/></>,
+    mail: <><rect x="3" y="5" width="18" height="14" rx="3"/><path d="m3 7 9 6 9-6"/></>,
+    "shield-check": <><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z"/><path d="m9 12 2 2 4-4"/></>,
+    settings: <><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06-2.83 2.83-.06-.06A1.7 1.7 0 0 0 15 19.4a1.7 1.7 0 0 0-1 .6 1.7 1.7 0 0 0-.4 1.1V21h-4v-.1A1.7 1.7 0 0 0 8.6 19.4a1.7 1.7 0 0 0-1.88.34l-.06.06-2.83-2.83.06-.06A1.7 1.7 0 0 0 4.6 15a1.7 1.7 0 0 0-.6-1 1.7 1.7 0 0 0-1.1-.4H3v-4h.1A1.7 1.7 0 0 0 4.6 8.6a1.7 1.7 0 0 0-.34-1.88l-.06-.06 2.83-2.83.06.06A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-.6 1.7 1.7 0 0 0 .4-1.1V3h4v.1A1.7 1.7 0 0 0 15.4 4.6a1.7 1.7 0 0 0 1.88-.34l.06-.06 2.83 2.83-.06.06A1.7 1.7 0 0 0 19.4 9c.15.38.38.72.7 1 .3.25.7.39 1.1.4h.1v4h-.1a1.7 1.7 0 0 0-1.8.6Z"/></>,
+    shop: <><path d="M3 9h18l-1.5-5h-15L3 9Z"/><path d="M5 9v11h14V9M9 20v-6h6v6"/></>,
+    trend: <><path d="M5 19 19 5M10 5h9v9"/></>,
+    blockchain: <><rect x="8" y="8" width="8" height="8" rx="2"/><path d="M5 8V5h3M16 5h3v3M19 16v3h-3M8 19H5v-3"/></>,
+    computer: <><rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></>,
+    phone: <><rect x="7" y="2" width="10" height="20" rx="2"/><path d="M11 18h2"/></>,
+    vehicle: <><path d="m5 17-1-4 2-5h12l2 5-1 4H5Z"/><path d="M7 17v2M17 17v2M6 13h12M8 11h.01M16 11h.01"/></>,
+    eye: <><path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/></>,
+    "eye-off": <><path d="m3 3 18 18M10.6 6.2A10.7 10.7 0 0 1 12 6c6.5 0 10 6 10 6a17 17 0 0 1-2.1 2.8M6.2 6.2C3.5 8 2 12 2 12s3.5 6 10 6a10 10 0 0 0 4.1-.8M9.9 9.9a3 3 0 0 0 4.2 4.2"/></>,
+  };
+
+  return (
+    <svg className="ui-icon" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      {paths[name] || paths.package}
+    </svg>
+  );
+}
+
+
+function PasswordField({ ariaLabel, ...props }) {
+  const [visible, setVisible] = useState(false);
+  return (
+    <div className="password-field">
+      <input {...props} type={visible ? "text" : "password"} aria-label={ariaLabel} />
+      <button
+        type="button"
+        className="password-toggle"
+        onClick={() => setVisible((current) => !current)}
+        aria-label={visible ? "Ẩn mật khẩu" : "Hiển thị mật khẩu"}
+        title={visible ? "Ẩn mật khẩu" : "Hiển thị mật khẩu"}
+      >
+        <Icon name={visible ? "eye-off" : "eye"} size={17} />
+      </button>
+    </div>
+  );
+}
 
 
 function Stat({
@@ -3431,9 +3474,7 @@ function AssetTable({
                     <div className="asset-name">
 
                       <div className="table-icon">
-                        {iconFor(
-                          asset.type
-                        )}
+                        <Icon name={iconFor(asset.type)} />
                       </div>
 
                       <div>
