@@ -1,45 +1,20 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
-  <title id="title">AssetChain blockchain logo</title>
-  <desc id="desc">A Bitcoin network connected to four blockchain cubes</desc>
-  <g fill="none" stroke="#5227b8" stroke-width="13" stroke-linecap="round" stroke-linejoin="round">
-    <path d="M196 204 151 169M316 204l45-35M194 306l-46 37M318 306l45 37"/>
-    <path d="M151 215v72M361 215v72M151 251h52M309 251h52"/>
+  <title id="title">AssetChain</title>
+  <desc id="desc">A minimal connected asset cube mark</desc>
+  <defs>
+    <linearGradient id="bg" x1="70" y1="60" x2="440" y2="460" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#7657dc"/>
+      <stop offset="1" stop-color="#45249b"/>
+    </linearGradient>
+  </defs>
+  <rect x="40" y="40" width="432" height="432" rx="128" fill="url(#bg)"/>
+  <g fill="none" stroke="#fff" stroke-width="24" stroke-linecap="round" stroke-linejoin="round">
+    <path d="m256 112 112 62v132l-112 64-112-64V174l112-62Z"/>
+    <path d="m144 174 112 64 112-64M256 238v132"/>
   </g>
-  <g stroke="#5227b8" stroke-width="10" stroke-linejoin="round">
-    <g>
-      <path fill="#ffb167" d="m68 72 54-31 54 31-54 31z"/>
-      <path fill="#a98ae8" d="m68 72 54 31v63l-54-31z"/>
-      <path fill="#c8b3f2" d="m176 72-54 31v63l54-31z"/>
-      <path fill="none" d="M122 103v63"/>
-      <path fill="#5227b8" stroke="none" d="m88 109 19 11v23l-19-11zM156 109l-19 11v23l19-11z"/>
-      <path fill="none" stroke-width="8" d="M105 70c5-9 16-9 22 0 6-9 17-9 22 0-5 10-16 10-22 1-6 9-17 9-22-1z"/>
-    </g>
-    <g>
-      <path fill="#ffb167" d="m336 72 54-31 54 31-54 31z"/>
-      <path fill="#a98ae8" d="m336 72 54 31v63l-54-31z"/>
-      <path fill="#c8b3f2" d="m444 72-54 31v63l54-31z"/>
-      <path fill="none" d="M390 103v63"/>
-      <path fill="#5227b8" stroke="none" d="m356 109 19 11v23l-19-11zM424 109l-19 11v23l19-11z"/>
-      <path fill="none" stroke-width="8" d="M382 55c-15 4-15 25 0 29M398 55c15 4 15 25 0 29M390 48v43"/>
-    </g>
-    <g>
-      <path fill="#ffb167" d="m68 376 54-31 54 31-54 31z"/>
-      <path fill="#a98ae8" d="m68 376 54 31v63l-54-31z"/>
-      <path fill="#c8b3f2" d="m176 376-54 31v63l54-31z"/>
-      <path fill="none" d="M122 407v63"/>
-      <path fill="#5227b8" stroke="none" d="m88 413 19 11v23l-19-11zM156 413l-19 11v23l19-11z"/>
-      <path fill="none" stroke-width="8" d="M105 374c3-11 15-15 24-8l8-6M139 386c-3 11-15 15-24 8l-8 6"/>
-    </g>
-    <g>
-      <path fill="#ffb167" d="m336 376 54-31 54 31-54 31z"/>
-      <path fill="#a98ae8" d="m336 376 54 31v63l-54-31z"/>
-      <path fill="#c8b3f2" d="m444 376-54 31v63l54-31z"/>
-      <path fill="none" d="M390 407v63"/>
-      <path fill="#5227b8" stroke="none" d="m356 413 19 11v23l-19-11zM424 413l-19 11v23l19-11z"/>
-      <path fill="none" stroke-width="8" d="M376 373c6-10 23-9 27 1 4 11-18 8-13 19 4 9 20 8 25-2"/>
-    </g>
+  <g fill="#b8ff61" stroke="#45249b" stroke-width="14">
+    <circle cx="144" cy="174" r="25"/>
+    <circle cx="368" cy="174" r="25"/>
+    <circle cx="256" cy="370" r="25"/>
   </g>
-  <circle cx="256" cy="256" r="86" fill="#ffd767" stroke="#5227b8" stroke-width="13"/>
-  <path fill="#5227b8" d="M229 208h35c26 0 41 11 41 29 0 11-6 20-16 24 13 4 21 14 21 29 0 22-17 34-46 34h-35v-16h13v-84h-13zm31 16v29h7c14 0 21-5 21-15 0-9-7-14-21-14zm0 45v39h9c16 0 24-6 24-19 0-13-8-20-25-20z"/>
-  <path stroke="#5227b8" stroke-width="7" d="M255 194v20M276 194v20M255 318v19M276 318v19"/>
 </svg>

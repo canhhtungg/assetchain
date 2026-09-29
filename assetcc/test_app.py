@@ -107,6 +107,52 @@ class AuthenticationApiTest(unittest.TestCase):
         )
 
     @patch("app.invoke_chaincode")
+    def test_history_uses_explicit_operations_and_keeps_delete_metadata(self, invoke):
+        invoke.return_value = {"success": True, "data": {"result": []}}
+        history = backend.enrich_asset_history([
+            {"value": {"id": "A1", "ownerID": "STORE", "lastOperation": "create"}},
+            {"value": {"id": "A1", "ownerID": "STORE", "lastOperation": "update", "lastActorID": "W1"}},
+            {"value": {"id": "A1", "ownerID": "STORE", "lastOperation": "delete", "deleted": True, "lastActorID": "W1"}},
+        ])
+        self.assertEqual([item["operation"] for item in history], ["create", "update", "delete"])
+        self.assertEqual(history[-1]["fromOwnerID"], "STORE")
+        self.assertEqual(history[-1]["toOwnerID"], "")
+
+    def test_customer_history_starts_at_latest_ownership_acquisition(self):
+        history = [
+            {"operation": "create", "toOwnerID": "STORE"},
+            {"operation": "update", "toOwnerID": "STORE"},
+            {"operation": "transfer", "fromOwnerID": "STORE", "toOwnerID": "C001"},
+            {"operation": "update", "toOwnerID": "C001"},
+            {"operation": "delete", "fromOwnerID": "C001", "toOwnerID": ""},
+        ]
+        visible = backend.history_visible_to_identity(
+            history, {"id": "C001", "role": "CUSTOMER"}
+        )
+        self.assertEqual(visible, history[2:])
+
+    @patch("app.invoke_chaincode")
+    def test_history_index_includes_owned_deleted_assets(self, invoke):
+        invoke.return_value = {
+            "success": True,
+            "data": {"result": [
+                {"id": "ACTIVE-1", "name": "Phone", "ownerID": "C001"},
+                {"id": "DELETED-1", "name": "Laptop", "ownerID": "C001", "deleted": True},
+                {"id": "OTHER-1", "name": "Other", "ownerID": "C002"},
+            ]},
+        }
+        token = backend.auth_serializer().dumps({"id": "C001", "role": "CUSTOMER"})
+        response = self.client.get(
+            "/api/assets/history-index",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            [item["id"] for item in response.get_json()["data"]],
+            ["ACTIVE-1", "DELETED-1"],
+        )
+
+    @patch("app.invoke_chaincode")
     def test_login_returns_user_and_signed_token(self, invoke):
         password_hash = generate_password_hash("correct-password")
         invoke.side_effect = [

@@ -768,11 +768,11 @@ useEffect(() => {
     const operation = record?.operation || "";
 
     let action = "Cập nhật";
-    if (operation === "delete" || isDelete) {
+    if (operation.startsWith("delete") || isDelete) {
       action = "Xóa tài sản";
     } else if (operation === "transfer" || (currentOwner && previousOwner && currentOwner !== previousOwner)) {
       action = "Chuyển quyền sở hữu";
-    } else if (operation === "create" || index === 0) {
+    } else if (operation === "create" || (!operation && index === 0)) {
       action = "Tạo tài sản";
     }
 
@@ -815,17 +815,16 @@ useEffect(() => {
   const loadBlockchainHistory = async () => {
     if (!currentUser) return;
 
-    const historyAssets = visibleAssets;
-
-    if (!historyAssets.length) {
-      setBlockchainHistory([]);
-      setHistoryError("");
-      return;
-    }
-
     try {
       setHistoryLoading(true);
       setHistoryError("");
+
+      const indexData = await apiRequest("/api/assets/history-index");
+      const historyAssets = Array.isArray(indexData.data) ? indexData.data : [];
+      if (!historyAssets.length) {
+        setBlockchainHistory([]);
+        return;
+      }
 
       const results = await Promise.all(
         historyAssets.map(async (asset) => {
@@ -1667,8 +1666,8 @@ useEffect(() => {
 
 
         <div className="search-box large">
-          <span>
-            🔍
+          <span className="search-icon">
+            <Icon name="search" size={16} />
           </span>
 
           <input
@@ -1907,7 +1906,7 @@ useEffect(() => {
       </div>
 
       <div className="search-box large" style={{ marginBottom: "18px" }}>
-        <span>🔍</span>
+        <span className="search-icon"><Icon name="search" size={16} /></span>
         <input
           value={transactionQuery}
           onChange={(event) => setTransactionQuery(event.target.value)}
@@ -3263,6 +3262,7 @@ function Icon({ name, size = 18 }) {
     computer: <><rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></>,
     phone: <><rect x="7" y="2" width="10" height="20" rx="2"/><path d="M11 18h2"/></>,
     vehicle: <><path d="m5 17-1-4 2-5h12l2 5-1 4H5Z"/><path d="M7 17v2M17 17v2M6 13h12M8 11h.01M16 11h.01"/></>,
+    search: <><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></>,
     eye: <><path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/></>,
     "eye-off": <><path d="m3 3 18 18M10.6 6.2A10.7 10.7 0 0 1 12 6c6.5 0 10 6 10 6a17 17 0 0 1-2.1 2.8M6.2 6.2C3.5 8 2 12 2 12s3.5 6 10 6a10 10 0 0 0 4.1-.8M9.9 9.9a3 3 0 0 0 4.2 4.2"/></>,
   };

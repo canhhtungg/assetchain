@@ -38,16 +38,18 @@ type UserCredential struct {
 // ================================
 
 type Asset struct {
-	ID           string `json:"id"`
-	Name         string `json:"name"`
-	Type         string `json:"type"`
-	OwnerID      string `json:"ownerID"`
-	Value        int    `json:"value"`
-	Quantity     int    `json:"quantity"`
-	Status       string `json:"status"`
-	SerialNumber string `json:"serialNumber"`
-	Description  string `json:"description"`
-	LastActorID  string `json:"lastActorID"`
+	ID            string `json:"id"`
+	Name          string `json:"name"`
+	Type          string `json:"type"`
+	OwnerID       string `json:"ownerID"`
+	Value         int    `json:"value"`
+	Quantity      int    `json:"quantity"`
+	Status        string `json:"status"`
+	SerialNumber  string `json:"serialNumber"`
+	Description   string `json:"description"`
+	LastActorID   string `json:"lastActorID"`
+	LastOperation string `json:"lastOperation,omitempty"`
+	Deleted       bool   `json:"deleted,omitempty"`
 }
 
 // ================================
@@ -366,16 +368,17 @@ func (s *SmartContract) CreateAsset(
 	}
 
 	asset := Asset{
-		ID:           id,
-		Name:         name,
-		Type:         assetType,
-		OwnerID:      ownerID,
-		Value:        value,
-		Quantity:     quantity,
-		Status:       status,
-		SerialNumber: serialNumber,
-		Description:  description,
-		LastActorID:  strings.TrimSpace(actorID),
+		ID:            id,
+		Name:          name,
+		Type:          assetType,
+		OwnerID:       ownerID,
+		Value:         value,
+		Quantity:      quantity,
+		Status:        status,
+		SerialNumber:  serialNumber,
+		Description:   description,
+		LastActorID:   strings.TrimSpace(actorID),
+		LastOperation: "create",
 	}
 
 	data, err := json.Marshal(asset)
@@ -388,6 +391,21 @@ func (s *SmartContract) CreateAsset(
 
 // ReadAsset returns an asset by ID.
 func (s *SmartContract) ReadAsset(
+	ctx contractapi.TransactionContextInterface,
+	id string,
+) (*Asset, error) {
+	asset, err := s.ReadAssetRecord(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if asset.Deleted {
+		return nil, fmt.Errorf("asset %s does not exist", id)
+	}
+	return asset, nil
+}
+
+// ReadAssetRecord returns an asset record, including a deletion tombstone.
+func (s *SmartContract) ReadAssetRecord(
 	ctx contractapi.TransactionContextInterface,
 	id string,
 ) (*Asset, error) {
@@ -456,16 +474,17 @@ func (s *SmartContract) UpdateAsset(
 	}
 
 	asset := Asset{
-		ID:           id,
-		Name:         name,
-		Type:         assetType,
-		OwnerID:      ownerID,
-		Value:        value,
-		Quantity:     quantity,
-		Status:       status,
-		SerialNumber: serialNumber,
-		Description:  description,
-		LastActorID:  strings.TrimSpace(actorID),
+		ID:            id,
+		Name:          name,
+		Type:          assetType,
+		OwnerID:       ownerID,
+		Value:         value,
+		Quantity:      quantity,
+		Status:        status,
+		SerialNumber:  serialNumber,
+		Description:   description,
+		LastActorID:   strings.TrimSpace(actorID),
+		LastOperation: "update",
 	}
 
 	data, err := json.Marshal(asset)
@@ -491,7 +510,17 @@ func (s *SmartContract) DeleteAsset(
 		return fmt.Errorf("asset %s does not exist", id)
 	}
 
-	return ctx.GetStub().DelState(id)
+	asset, err := s.ReadAsset(ctx, id)
+	if err != nil {
+		return err
+	}
+	asset.Deleted = true
+	asset.LastOperation = "delete"
+	data, err := json.Marshal(asset)
+	if err != nil {
+		return err
+	}
+	return ctx.GetStub().PutState(id, data)
 }
 
 // DeleteAssetQuantity removes all or part of an asset quantity.
@@ -509,10 +538,18 @@ func (s *SmartContract) DeleteAssetQuantity(
 		return fmt.Errorf("quantity must be between 1 and %d", asset.Quantity)
 	}
 	if quantity == asset.Quantity {
-		return ctx.GetStub().DelState(id)
+		asset.Deleted = true
+		asset.LastActorID = strings.TrimSpace(actorID)
+		asset.LastOperation = "delete"
+		data, err := json.Marshal(asset)
+		if err != nil {
+			return err
+		}
+		return ctx.GetStub().PutState(id, data)
 	}
 	asset.Quantity -= quantity
 	asset.LastActorID = strings.TrimSpace(actorID)
+	asset.LastOperation = "delete_quantity"
 	data, err := json.Marshal(asset)
 	if err != nil {
 		return err
@@ -567,6 +604,7 @@ func (s *SmartContract) TransferAsset(
 
 	asset.OwnerID = newOwnerID
 	asset.LastActorID = strings.TrimSpace(actorID)
+	asset.LastOperation = "transfer"
 
 	data, err := json.Marshal(asset)
 	if err != nil {
@@ -588,6 +626,7 @@ func (s *SmartContract) ReturnAssetToStore(ctx contractapi.TransactionContextInt
 	asset.OwnerID = "STORE"
 	asset.Status = "Active"
 	asset.LastActorID = strings.TrimSpace(actorID)
+	asset.LastOperation = "transfer"
 	data, err := json.Marshal(asset)
 	if err != nil {
 		return err
@@ -627,6 +666,7 @@ func (s *SmartContract) TransferAssetQuantity(
 	if quantity == asset.Quantity {
 		asset.OwnerID = newOwnerID
 		asset.LastActorID = strings.TrimSpace(actorID)
+		asset.LastOperation = "transfer"
 		data, err := json.Marshal(asset)
 		if err != nil {
 			return err
@@ -652,8 +692,10 @@ func (s *SmartContract) TransferAssetQuantity(
 	soldAsset.Quantity = quantity
 	soldAsset.Status = "Sold"
 	soldAsset.LastActorID = strings.TrimSpace(actorID)
+	soldAsset.LastOperation = "transfer"
 	asset.Quantity -= quantity
 	asset.LastActorID = strings.TrimSpace(actorID)
+	asset.LastOperation = "update"
 
 	remainingData, err := json.Marshal(asset)
 	if err != nil {
@@ -719,6 +761,9 @@ func (s *SmartContract) GetAssetsByOwner(
 		if asset.Quantity < 1 {
 			asset.Quantity = 1
 		}
+		if asset.Deleted {
+			continue
+		}
 
 		if asset.OwnerID == ownerID {
 			assets = append(
@@ -781,6 +826,9 @@ func (s *SmartContract) GetAllAssets(
 		if asset.Quantity < 1 {
 			asset.Quantity = 1
 		}
+		if asset.Deleted {
+			continue
+		}
 
 		assets = append(
 			assets,
@@ -788,6 +836,38 @@ func (s *SmartContract) GetAllAssets(
 		)
 	}
 
+	return assets, nil
+}
+
+// GetAllAssetRecords returns active assets and deletion tombstones for history discovery.
+func (s *SmartContract) GetAllAssetRecords(
+	ctx contractapi.TransactionContextInterface,
+) ([]*Asset, error) {
+	resultsIterator, err := ctx.GetStub().GetStateByRange("", "")
+	if err != nil {
+		return nil, err
+	}
+	defer resultsIterator.Close()
+
+	var assets []*Asset
+	for resultsIterator.HasNext() {
+		queryResponse, err := resultsIterator.Next()
+		if err != nil {
+			return nil, err
+		}
+		if strings.HasPrefix(queryResponse.Key, "USER_") ||
+			strings.HasPrefix(queryResponse.Key, "USER_CREDENTIAL_") {
+			continue
+		}
+		var asset Asset
+		if err := json.Unmarshal(queryResponse.Value, &asset); err != nil || asset.ID == "" {
+			continue
+		}
+		if asset.Quantity < 1 {
+			asset.Quantity = 1
+		}
+		assets = append(assets, &asset)
+	}
 	return assets, nil
 }
 

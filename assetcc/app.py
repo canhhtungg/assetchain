@@ -749,6 +749,14 @@ def read_chaincode_asset(asset_id):
     return asset if isinstance(asset, dict) else None, result
 
 
+def read_chaincode_asset_record(asset_id):
+    result = invoke_chaincode("ReadAssetRecord", [str(asset_id)])
+    if not result.get("success"):
+        return None, result
+    asset = parse_chaincode_result(result)
+    return asset if isinstance(asset, dict) else None, result
+
+
 def user_reference(user_id, directory):
     user_id = str(user_id or "")
     if not user_id:
@@ -778,7 +786,16 @@ def enrich_asset_history(history):
         value = record.get("value") or record.get("Value") or {}
         if not isinstance(value, dict):
             value = {}
-        is_delete = bool(record.get("isDelete") or record.get("IsDelete"))
+        explicit_operation = str(
+            value.get("lastOperation") or value.get("LastOperation") or ""
+        ).strip().lower()
+        is_delete = bool(
+            record.get("isDelete")
+            or record.get("IsDelete")
+            or value.get("deleted")
+            or value.get("Deleted")
+            or explicit_operation.startswith("delete")
+        )
         current_owner_id = str(value.get("ownerID") or value.get("OwnerID") or "")
         actor_id = str(value.get("lastActorID") or value.get("LastActorID") or "")
         from_owner_id = ""
@@ -797,7 +814,9 @@ def enrich_asset_history(history):
             from_owner_id = STORE_USER_ID
 
         if is_delete:
-            operation = "delete"
+            operation = explicit_operation or "delete"
+        elif explicit_operation in {"create", "update", "transfer"}:
+            operation = explicit_operation
         elif from_owner_id and to_owner_id and from_owner_id != to_owner_id:
             operation = "transfer"
         elif index == 0:
@@ -807,6 +826,7 @@ def enrich_asset_history(history):
 
         record.update({
             "operation": operation,
+            "isDelete": is_delete,
             "actorID": actor_id,
             "actor": user_reference(actor_id, directory),
             "fromOwnerID": from_owner_id,
@@ -818,6 +838,24 @@ def enrich_asset_history(history):
         if not is_delete and current_owner_id:
             previous_owner_id = current_owner_id
     return enriched
+
+
+def history_visible_to_identity(history, identity):
+    role = normalize_role(identity.get("role"))
+    if role != "customer":
+        return history
+
+    user_id = str(identity.get("id", ""))
+    ownership_start = None
+    for index, record in enumerate(history):
+        if (
+            str(record.get("toOwnerID", "")) == user_id
+            and str(record.get("operation", "")) in {"create", "transfer"}
+        ):
+            ownership_start = index
+    if ownership_start is None:
+        return []
+    return history[ownership_start:]
 
 
 def require_auth(admin_only=False, permission=None, allow_password_change=False):
@@ -1629,6 +1667,32 @@ def transfer_asset(asset_id):
 # ASSET HISTORY
 # ==========================================
 
+@app.route("/api/assets/history-index", methods=["GET"])
+@require_auth(permission="view_history")
+def asset_history_index():
+    result = invoke_chaincode("GetAllAssetRecords", [])
+    records = parse_chaincode_result(result)
+    if not result.get("success") or not isinstance(records, list):
+        return jsonify({
+            "status": "error",
+            "message": "Không thể lấy danh mục lịch sử tài sản",
+            "fabric_response": result,
+        }), 500
+
+    visible = [
+        {
+            "id": str(asset.get("id", "")),
+            "name": str(asset.get("name", "") or "Tài sản"),
+            "ownerID": str(asset.get("ownerID", "")),
+            "deleted": bool(asset.get("deleted", False)),
+        }
+        for asset in records
+        if isinstance(asset, dict)
+        and asset.get("id")
+        and can_view_asset(request.auth_user, asset)
+    ]
+    return jsonify({"status": "success", "data": visible})
+
 @app.route(
     "/api/assets/<asset_id>/history",
     methods=["GET"]
@@ -1636,7 +1700,7 @@ def transfer_asset(asset_id):
 @require_auth()
 def asset_history(asset_id):
 
-    asset, read_result = read_chaincode_asset(asset_id)
+    asset, read_result = read_chaincode_asset_record(asset_id)
     if not asset:
         return jsonify({"status": "error", "message": "Tài sản không tồn tại"}), 404
     if not has_permission(request.auth_user, "view_history") or not can_view_asset(request.auth_user, asset):
@@ -1659,6 +1723,7 @@ def asset_history(asset_id):
     if not isinstance(history, list):
         history = []
     history = enrich_asset_history(history)
+    history = history_visible_to_identity(history, request.auth_user)
     if normalize_role(request.auth_user.get("role")) == "warehouse":
         actor_id = str(request.auth_user.get("id"))
         history = [

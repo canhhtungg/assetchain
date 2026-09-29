@@ -137,6 +137,9 @@ func TestStoreInventoryQuantityAndPartialSale(t *testing.T) {
 	if sold.LastActorID != "S001" {
 		t.Fatalf("expected sales actor, got %q", sold.LastActorID)
 	}
+	if sold.LastOperation != "transfer" || remaining.LastOperation != "update" {
+		t.Fatalf("unexpected sale operations: sold=%q remaining=%q", sold.LastOperation, remaining.LastOperation)
+	}
 	if err := contract.ReturnAssetToStore(context, "SALE-1", "C001"); err != nil {
 		t.Fatalf("ReturnAssetToStore returned an error: %v", err)
 	}
@@ -150,6 +153,49 @@ func TestStoreInventoryQuantityAndPartialSale(t *testing.T) {
 	remainingReturned, err := contract.ReadAsset(context, "SALE-1")
 	if err != nil || remainingReturned.Quantity != 1 || remainingReturned.LastActorID != "C001" {
 		t.Fatalf("unexpected quantity after partial delete: %#v, %v", remainingReturned, err)
+	}
+	if remainingReturned.LastOperation != "delete_quantity" {
+		t.Fatalf("expected delete_quantity operation, got %q", remainingReturned.LastOperation)
+	}
+}
+
+func TestAssetOperationsAndDeletionTombstone(t *testing.T) {
+	context, _ := newTestContext(t)
+	contract := new(SmartContract)
+	if err := contract.CreateUser(context, "C001", "customer", "Customer", "CUSTOMER", "hash", "", "A001"); err != nil {
+		t.Fatalf("failed to create owner: %v", err)
+	}
+	if err := contract.CreateAsset(context, "A-OPS", "Laptop", "Computer", "C001", 100, "Active", "", "", 1, "W001"); err != nil {
+		t.Fatalf("failed to create asset: %v", err)
+	}
+	created, err := contract.ReadAsset(context, "A-OPS")
+	if err != nil || created.LastOperation != "create" {
+		t.Fatalf("expected create operation: %#v, %v", created, err)
+	}
+	if err := contract.UpdateAsset(context, "A-OPS", "Laptop Pro", "Computer", "C001", 120, "Active", "", "", 1, "W001"); err != nil {
+		t.Fatalf("failed to update asset: %v", err)
+	}
+	updated, err := contract.ReadAsset(context, "A-OPS")
+	if err != nil || updated.LastOperation != "update" {
+		t.Fatalf("expected update operation: %#v, %v", updated, err)
+	}
+	if err := contract.DeleteAssetQuantity(context, "A-OPS", 1, "C001"); err != nil {
+		t.Fatalf("failed to delete asset: %v", err)
+	}
+	if _, err := contract.ReadAsset(context, "A-OPS"); err == nil {
+		t.Fatal("deleted asset should not be readable as active")
+	}
+	tombstone, err := contract.ReadAssetRecord(context, "A-OPS")
+	if err != nil || !tombstone.Deleted || tombstone.LastOperation != "delete" || tombstone.LastActorID != "C001" {
+		t.Fatalf("unexpected deletion tombstone: %#v, %v", tombstone, err)
+	}
+	active, err := contract.GetAllAssets(context)
+	if err != nil || len(active) != 0 {
+		t.Fatalf("deleted asset leaked into active list: %#v, %v", active, err)
+	}
+	records, err := contract.GetAllAssetRecords(context)
+	if err != nil || len(records) != 1 || !records[0].Deleted {
+		t.Fatalf("deletion tombstone missing from history index: %#v, %v", records, err)
 	}
 }
 
