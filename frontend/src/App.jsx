@@ -168,6 +168,7 @@ function App() {
   const [loginUsername, setLoginUsername] = useState("");
   const [loginPassword, setLoginPassword] = useState("");
   const [loginLoading, setLoginLoading] = useState(false);
+  const [firstLoginPassword, setFirstLoginPassword] = useState("");
   const [permissions, setPermissions] = useState([]);
   const [permissionConfig, setPermissionConfig] = useState(null);
   const [passwordResetRequests, setPasswordResetRequests] = useState([]);
@@ -593,7 +594,14 @@ useEffect(() => {
     return ["manager", "sales", "warehouse"].includes(role) || (isAdmin && role === "admin");
   });
   const customers = users.filter((user) => normalizeRole(user.role) === "customer");
-  const canManageUsers = can("view_users") || can("view_customers") || can("create_staff") || can("create_customer");
+  const canAccessUsers = [
+    "view_users",
+    "view_customers",
+    "create_staff",
+    "create_customer",
+    "update_user",
+    "update_own_contact",
+  ].some(can);
   const creatableRoles = isAdmin
     ? ["manager", "sales", "warehouse", "customer", "admin"]
     : isManager
@@ -1343,10 +1351,11 @@ useEffect(() => {
 
     try {
       setLoginLoading(true);
+      const enteredPassword = loginPassword;
       const response = await fetch(`${API_URL}/api/auth/login`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ username, password: loginPassword }),
+        body: JSON.stringify({ username, password: enteredPassword }),
       });
       const payload = await response.json();
       if (!response.ok) {
@@ -1356,6 +1365,7 @@ useEffect(() => {
 
       setCurrentUser(user);
       setAuthToken(token);
+      setFirstLoginPassword(user.mustChangePassword ? enteredPassword : "");
       localStorage.setItem("assetchain-session", JSON.stringify({ user, token }));
       setLoginUsername("");
       setLoginPassword("");
@@ -1415,6 +1425,7 @@ useEffect(() => {
       const { user, token } = payload.data;
       setCurrentUser(user);
       setAuthToken(token);
+      setFirstLoginPassword("");
       localStorage.setItem("assetchain-session", JSON.stringify({ user, token }));
       setNotice("Đổi mật khẩu thành công");
       setPage("dashboard");
@@ -1429,6 +1440,7 @@ useEffect(() => {
     localStorage.removeItem("assetchain-session");
     setCurrentUser(null);
     setAuthToken("");
+    setFirstLoginPassword("");
     setAssets([]);
     setUsers([]);
     setNetwork(null);
@@ -1492,7 +1504,7 @@ useEffect(() => {
             label={isManager ? "Nhân viên" : isAdmin ? "Người dùng" : "Tài khoản"}
             value={isManager ? employees.length : isAdmin ? users.length : 1}
             small={isManager ? "Bán hàng và kho" : isAdmin ? "Quản lý trên Blockchain" : ROLE_LABELS[currentRole]}
-            onClick={() => setPage(canManageUsers ? "users" : "settings")}
+            onClick={() => setPage(canAccessUsers ? "users" : "settings")}
           />
 
           {isManager && (
@@ -1687,9 +1699,19 @@ useEffect(() => {
 
   const renderUsers =
     () => {
-      if (!canManageUsers) return null;
-      const effectiveUserTab = can("view_users") ? userTab : "customers";
-      const displayedUsers = effectiveUserTab === "employees" ? employees : customers;
+      if (!canAccessUsers) return null;
+      const canViewEmployees = can("view_users");
+      const canViewCustomers = can("view_users") || can("view_customers");
+      const effectiveUserTab = canViewEmployees
+        ? userTab
+        : canViewCustomers
+        ? "customers"
+        : "profile";
+      const displayedUsers = effectiveUserTab === "employees"
+        ? employees
+        : effectiveUserTab === "customers"
+        ? customers
+        : users.filter((user) => user.id === currentUser?.id);
       return (
         <>
         <div className="page-toolbar">
@@ -1727,13 +1749,20 @@ useEffect(() => {
               Nhân viên ({employees.length})
             </button>
           )}
-          <button
-            className={effectiveUserTab === "customers" ? "primary-button" : "secondary-button"}
-            onClick={() => setUserTab("customers")}
-            style={{ background: effectiveUserTab === "customers" ? "#16a34a" : undefined }}
-          >
-            Khách hàng ({customers.length})
-          </button>
+          {canViewCustomers && (
+            <button
+              className={effectiveUserTab === "customers" ? "primary-button" : "secondary-button"}
+              onClick={() => setUserTab("customers")}
+              style={{ background: effectiveUserTab === "customers" ? "#16a34a" : undefined }}
+            >
+              Khách hàng ({customers.length})
+            </button>
+          )}
+          {effectiveUserTab === "profile" && (
+            <button className="primary-button" type="button">
+              Hồ sơ của tôi
+            </button>
+          )}
         </div>
 
         <div className="simple-grid">
@@ -2383,6 +2412,7 @@ useEffect(() => {
         <style>{THEME_STYLES}</style>
         <PasswordChangeScreen
           username={currentUser.username}
+          initialCurrentPassword={firstLoginPassword}
           loading={loading}
           onSave={changeCurrentPassword}
           onLogout={logout}
@@ -2431,8 +2461,8 @@ useEffect(() => {
         <nav>
           {[
             ["dashboard", "▣", "Dashboard"],
-            ["assets", "▤", isWarehouse ? "Sản phẩm trong kho" : "Tài sản"],
-            ...(canManageUsers ? [["users", "♙", "Nhân sự & khách hàng"]] : []),
+            ["assets", "▤", "Tài sản"],
+            ...(canAccessUsers ? [["users", "♙", "Nhân sự & người dùng"]] : []),
             ...(can("view_history") ? [["transactions", "◷", "Lịch sử giao dịch"]] : []),
             ...(isAdmin ? [["requests", "✉", `Yêu cầu${pendingResetCount ? ` (${pendingResetCount})` : ""}`]] : []),
             ...(isAdmin ? [["permissions", "✓", "Phân quyền"]] : []),
@@ -2615,7 +2645,7 @@ useEffect(() => {
             renderAssets()}
 
           {page === "users" &&
-            (canManageUsers ? renderUsers() : null)}
+            (canAccessUsers ? renderUsers() : null)}
 
           {page === "transactions" &&
             renderTransactions()}
@@ -3133,9 +3163,9 @@ function NoticeModal({ message, onClose }) {
 }
 
 
-function PasswordChangeScreen({ username, loading, onSave, onLogout }) {
+function PasswordChangeScreen({ username, initialCurrentPassword, loading, onSave, onLogout }) {
   const [form, setForm] = useState({
-    currentPassword: "",
+    currentPassword: initialCurrentPassword || "",
     newPassword: "",
     confirmPassword: "",
   });
