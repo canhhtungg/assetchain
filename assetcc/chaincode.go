@@ -48,8 +48,8 @@ type Asset struct {
 	SerialNumber  string `json:"serialNumber"`
 	Description   string `json:"description"`
 	LastActorID   string `json:"lastActorID"`
-	LastOperation string `json:"lastOperation,omitempty"`
-	Deleted       bool   `json:"deleted,omitempty"`
+	LastOperation string `json:"lastOperation"`
+	Deleted       bool   `json:"deleted"`
 }
 
 // ================================
