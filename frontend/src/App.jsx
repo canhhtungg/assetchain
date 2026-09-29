@@ -93,196 +93,7 @@ function parseChaincodeResult(data, fallback = []) {
 
 
 
-const THEME_STYLES = `
-  html, body, #root { min-height: 100%; }
-
-  body { transition: background-color .25s ease, color .25s ease; }
-
-  [data-assetchain-theme="light"] body {
-    background: #f5f7fb !important;
-    color: #172033 !important;
-  }
-
-  [data-assetchain-theme="dark"] body {
-    background: #0b1220 !important;
-    color: #e5e7eb !important;
-  }
-
-  [data-assetchain-theme="dark"] .app,
-  [data-assetchain-theme="dark"] .main,
-  [data-assetchain-theme="dark"] .content,
-  [data-assetchain-theme="dark"] .header {
-    background: #0b1220 !important;
-    color: #e5e7eb !important;
-  }
-
-  [data-assetchain-theme="dark"] .header {
-    border-bottom-color: #263247 !important;
-  }
-
-  [data-assetchain-theme="dark"] .sidebar {
-    background: #0f172a !important;
-    border-right-color: #1f2937 !important;
-  }
-
-  [data-assetchain-theme="dark"] .menu-item { color: #cbd5e1 !important; }
-  [data-assetchain-theme="dark"] .menu-item:hover {
-    background: #1e293b !important;
-    color: #fff !important;
-  }
-  [data-assetchain-theme="dark"] .menu-item.active {
-    background: #2563eb !important;
-    color: #fff !important;
-  }
-
-  [data-assetchain-theme="dark"] .menu-title,
-  [data-assetchain-theme="dark"] .network-name,
-  [data-assetchain-theme="dark"] .user-role,
-  [data-assetchain-theme="dark"] .logo-subtitle,
-  [data-assetchain-theme="dark"] .muted,
-  [data-assetchain-theme="dark"] .percentage {
-    color: #94a3b8 !important;
-  }
-
-  [data-assetchain-theme="dark"] .logo-title,
-  [data-assetchain-theme="dark"] .header h1,
-  [data-assetchain-theme="dark"] .content h1,
-  [data-assetchain-theme="dark"] .content h2,
-  [data-assetchain-theme="dark"] .content h3,
-  [data-assetchain-theme="dark"] .user-name,
-  [data-assetchain-theme="dark"] .asset-name {
-    color: #f8fafc !important;
-  }
-
-  [data-assetchain-theme="dark"] .stat-card,
-  [data-assetchain-theme="dark"] .asset-type-card,
-  [data-assetchain-theme="dark"] .table-card,
-  [data-assetchain-theme="dark"] .settings-card,
-  [data-assetchain-theme="dark"] .modal,
-  [data-assetchain-theme="dark"] .drawer {
-    background: #111827 !important;
-    color: #e5e7eb !important;
-    border-color: #263247 !important;
-    box-shadow: 0 10px 30px rgba(0,0,0,.28) !important;
-  }
-
-  [data-assetchain-theme="dark"] .stat-info h3,
-  [data-assetchain-theme="dark"] .stat-info p,
-  [data-assetchain-theme="dark"] .section-header p,
-  [data-assetchain-theme="dark"] .page-toolbar p {
-    color: #94a3b8 !important;
-  }
-
-  [data-assetchain-theme="dark"] table,
-  [data-assetchain-theme="dark"] th,
-  [data-assetchain-theme="dark"] td {
-    border-color: #263247 !important;
-  }
-
-  [data-assetchain-theme="dark"] th {
-    background: #0f172a !important;
-    color: #94a3b8 !important;
-  }
-
-  [data-assetchain-theme="dark"] td { color: #dbe4f0 !important; }
-
-  [data-assetchain-theme="dark"] tr:hover td {
-    background: #172033 !important;
-  }
-
-  [data-assetchain-theme="dark"] input,
-  [data-assetchain-theme="dark"] textarea,
-  [data-assetchain-theme="dark"] select,
-  [data-assetchain-theme="dark"] .search-box {
-    background: #0f172a !important;
-    color: #f8fafc !important;
-    border-color: #334155 !important;
-  }
-
-  [data-assetchain-theme="dark"] input::placeholder,
-  [data-assetchain-theme="dark"] textarea::placeholder {
-    color: #64748b !important;
-  }
-
-  [data-assetchain-theme="dark"] .detail-list > div,
-  [data-assetchain-theme="dark"] .setting-row {
-    border-color: #263247 !important;
-  }
-
-  [data-assetchain-theme="dark"] .user-card {
-    background: #0f172a !important;
-    border-color: #334155 !important;
-  }
-
-  [data-assetchain-theme="dark"] .drawer-backdrop,
-  [data-assetchain-theme="dark"] .modal-backdrop {
-    background: rgba(2,6,23,.72) !important;
-  }
-
-  [data-assetchain-theme="dark"] pre {
-    background: #0b1220 !important;
-    color: #cbd5e1 !important;
-    border-color: #263247 !important;
-  }
-
-  [data-assetchain-theme="dark"] .secondary-button {
-    background: #1e293b !important;
-    color: #e2e8f0 !important;
-    border-color: #334155 !important;
-  }
-
-  [data-assetchain-theme="dark"] .secondary-button:hover {
-    background: #334155 !important;
-  }
-
-  [data-assetchain-theme="dark"] .assetchain-login-page {
-    background: #0b1220 !important;
-  }
-
-  [data-assetchain-theme="dark"] .assetchain-login-card {
-    background: #111827 !important;
-    color: #e5e7eb !important;
-    border-color: #263247 !important;
-  }
-
-  [data-assetchain-theme="dark"] .assetchain-login-card .login-title,
-  [data-assetchain-theme="dark"] .assetchain-login-card label {
-    color: #f8fafc !important;
-  }
-
-  [data-assetchain-theme="dark"] .assetchain-login-card .login-subtitle {
-    color: #94a3b8 !important;
-  }
-
-  [data-assetchain-theme="dark"] .assetchain-login-card input {
-    background: #0f172a !important;
-    color: #f8fafc !important;
-    border-color: #334155 !important;
-  }
-
-  [data-assetchain-theme="light"] .app,
-  [data-assetchain-theme="light"] .main,
-  [data-assetchain-theme="light"] .content,
-  [data-assetchain-theme="light"] .header {
-    background: #f5f7fb !important;
-    color: #172033 !important;
-  }
-
-  [data-assetchain-theme="light"] .sidebar {
-    background: #0f172a !important;
-  }
-
-  [data-assetchain-theme="light"] .stat-card,
-  [data-assetchain-theme="light"] .asset-type-card,
-  [data-assetchain-theme="light"] .table-card,
-  [data-assetchain-theme="light"] .settings-card,
-  [data-assetchain-theme="light"] .modal,
-  [data-assetchain-theme="light"] .drawer {
-    background: #fff !important;
-    color: #172033 !important;
-    border-color: #e5e7eb !important;
-  }
-`;
+const THEME_STYLES = ``;
 
 
 function formatAssetValue(value) {
@@ -365,7 +176,7 @@ function App() {
 
   const [themeMode, setThemeMode] = useState(() => {
     try {
-      return localStorage.getItem("assetchain-theme") || "system";
+      return localStorage.getItem("assetchain-theme") || "dark";
     } catch {
       return "system";
     }
@@ -2451,7 +2262,7 @@ useEffect(() => {
           }}
         >
           <div style={{ display: "flex", alignItems: "center", gap: "14px", marginBottom: "28px" }}>
-            <div className="logo-icon">🛡</div>
+            <div className="logo-icon">AC</div>
             <div>
               <div className="logo-title" style={{ color: "#111827" }}>AssetChain</div>
               <div className="logo-subtitle" style={{ color: "#6b7280" }}>Blockchain Management</div>
@@ -2588,9 +2399,7 @@ useEffect(() => {
 
         <div className="logo">
 
-          <div className="logo-icon">
-            🛡
-          </div>
+          <div className="logo-icon">AC</div>
 
           <div>
 
@@ -3343,7 +3152,7 @@ function PasswordChangeScreen({ username, loading, onSave, onLogout }) {
     <div className="assetchain-login-page password-change-page">
       <form className="assetchain-login-card password-change-card" onSubmit={submit}>
         <div className="password-change-brand">
-          <div className="logo-icon">🛡</div>
+          <div className="logo-icon">AC</div>
           <div>
             <div className="logo-title">AssetChain</div>
             <div className="logo-subtitle">Bảo mật tài khoản</div>
@@ -3430,7 +3239,11 @@ function Stat({
         <strong
           className={
             label === "Blockchain"
-              ? "online-text"
+              ? value === "Online"
+                ? "online-text"
+                : value === "Offline"
+                ? "offline-text"
+                : ""
               : ""
           }
         >
