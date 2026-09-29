@@ -3,7 +3,9 @@ import "./App.css";
 
 const API_URL =
   import.meta.env.VITE_API_URL ||
-  "http://127.0.0.1:5000";
+  (import.meta.env.PROD
+    ? "https://ubuntu-fabric.tail3949da.ts.net"
+    : "http://127.0.0.1:5000");
 const ADMIN_OWNER_ID = "U001";
 
 const ROLE_LABELS = {
