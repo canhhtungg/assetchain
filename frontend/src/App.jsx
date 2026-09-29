@@ -1483,6 +1483,7 @@ useEffect(() => {
             label={isManager || isWarehouse ? "Tồn kho" : "Tổng tài sản"}
             value={isManager || isWarehouse ? inventoryQuantity : visibleAssets.length}
             small={isManager || isWarehouse ? `${inventoryAssets.length} mã sản phẩm` : `${activeCount} đang hoạt động`}
+            onClick={() => setPage("assets")}
           />
 
           <Stat
@@ -1491,6 +1492,7 @@ useEffect(() => {
             label={isManager ? "Nhân viên" : isAdmin ? "Người dùng" : "Tài khoản"}
             value={isManager ? employees.length : isAdmin ? users.length : 1}
             small={isManager ? "Bán hàng và kho" : isAdmin ? "Quản lý trên Blockchain" : ROLE_LABELS[currentRole]}
+            onClick={() => setPage(canManageUsers ? "users" : "settings")}
           />
 
           {isManager && (
@@ -1500,6 +1502,7 @@ useEffect(() => {
               label="Khách hàng"
               value={customers.length}
               small="Tài khoản khách hàng"
+              onClick={() => setPage("users")}
             />
           )}
 
@@ -1509,6 +1512,7 @@ useEffect(() => {
             label="Giao dịch"
             value={visibleTransactions.length}
             small="Lịch sử thao tác"
+            onClick={() => setPage("transactions")}
           />
 
           <Stat
@@ -1523,6 +1527,7 @@ useEffect(() => {
                 : "..."
             }
             small="Hyperledger Fabric"
+            onClick={() => setPage("settings")}
           />
         </div>
 
@@ -3222,9 +3227,15 @@ function Stat({
   label,
   value,
   small,
+  onClick,
 }) {
   return (
-    <div className="stat-card">
+    <button
+      type="button"
+      className="stat-card"
+      onClick={onClick}
+      aria-label={`Mở trang ${label}`}
+    >
 
       <div
         className={`stat-icon ${tone}`}
@@ -3258,7 +3269,7 @@ function Stat({
 
       </div>
 
-    </div>
+    </button>
   );
 }
 
