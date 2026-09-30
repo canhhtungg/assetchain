@@ -340,7 +340,8 @@ select:focus, input:focus, textarea:focus { border-color: rgba(184,255,97,.48); 
   background-repeat: no-repeat;
 }
 .permission-cell input:disabled { opacity: 1; cursor: not-allowed; }
-.permission-admin-row .permission-role-column, .permission-admin-row .permission-cell { background: rgba(109,106,255,.1); }
+.permission-admin-row .permission-role-column { background: #1d1f3c; }
+.permission-admin-row .permission-cell { background: rgba(109,106,255,.1); }
 .permission-admin-row .permission-role-column span { color: #aaa8ff; }
 [data-assetchain-theme="light"] .permission-matrix thead th,
 [data-assetchain-theme="light"] .permission-matrix .permission-role-column { background: #f2f4ec; color: #53604d; }
