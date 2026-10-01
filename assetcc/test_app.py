@@ -907,6 +907,31 @@ class AuthenticationApiTest(unittest.TestCase):
         self.assertEqual(identity_request["status"], "pending")
 
     @patch("app.invoke_chaincode")
+    def test_auto_user_id_never_reuses_revoked_identity_history(self, invoke):
+        backend.save_identity_binding({
+            "user_id": "user_9", "key_id": "revoked-key-9",
+            "organization_id": "12", "msp_id": "Org1MSP",
+            "certificate_fingerprint": "9" * 64,
+            "key_name": "assetchain-user_9", "status": "revoked",
+        })
+        invoke.side_effect = [
+            {"success": True, "data": {"result": [{"id": "S001"}, {"id": "C001"}]}},
+            {"success": True, "data": {"result": {}}},
+        ]
+        token = backend.auth_serializer().dumps({"id": "S001", "role": "SALES"})
+        response = self.client.post(
+            "/api/users",
+            json={
+                "username": "fresh-customer", "fullName": "Fresh Customer",
+                "role": "customer", "contact": "fresh@example.com",
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["data"]["id"], "user_10")
+        self.assertEqual(invoke.call_args_list[1].args[1][0], "user_10")
+
+    @patch("app.invoke_chaincode")
     def test_customer_can_only_update_own_contact(self, invoke):
         token = backend.auth_serializer().dumps(dict(id="C001", role="CUSTOMER"))
         invoke.side_effect = [

@@ -433,6 +433,20 @@ def identity_binding(user_id, include_inactive=False):
     return dict(row) if row else None
 
 
+def historical_identity_user_ids():
+    """Return IDs retained by identity history so deleted users are never reused."""
+    connection = identity_registry_connection()
+    if connection is None:
+        return set()
+    rows = connection.execute(
+        """SELECT user_id FROM fabric_identity_bindings
+           UNION
+           SELECT user_id FROM fabric_identity_requests"""
+    ).fetchall()
+    connection.close()
+    return {str(row[0]) for row in rows if row[0]}
+
+
 def add_fabric_identity_request(user, requested_by):
     """Queue one durable, de-duplicated provisioning request for a ledger user."""
     user_id = str(user.get("id", "")).strip()
@@ -3166,7 +3180,13 @@ def create_user():
             return jsonify({"status": "error", "message": "Không thể tạo mã người dùng tự động"}), 500
         users = [user for user in users if normalize_role(user.get("role")) != "store"]
         existing_ids = {str(user.get("id")) for user in users}
-        sequence = len(users) + 1
+        existing_ids.update(historical_identity_user_ids())
+        numeric_suffixes = [
+            int(value.removeprefix("user_"))
+            for value in existing_ids
+            if value.startswith("user_") and value.removeprefix("user_").isdigit()
+        ]
+        sequence = max(len(users) + 1, max(numeric_suffixes, default=0) + 1)
         user_id = f"user_{sequence}"
         while user_id in existing_ids:
             sequence += 1
