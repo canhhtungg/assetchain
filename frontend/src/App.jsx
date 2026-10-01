@@ -8,6 +8,11 @@ const API_URL =
     : "http://127.0.0.1:5000");
 const ADMIN_OWNER_ID = "U001";
 
+const apiFetch = (url, options = {}) => fetch(url, {
+  credentials: "include",
+  ...options,
+});
+
 const ROLE_LABELS = {
   admin: "Admin",
   manager: "Quản lý",
@@ -151,7 +156,7 @@ function App() {
 
   const [currentUser, setCurrentUser] = useState(() => {
     try {
-      return JSON.parse(localStorage.getItem("assetchain-session"))?.user || null;
+      return JSON.parse(sessionStorage.getItem("assetchain-session"))?.user || null;
     } catch {
       return null;
     }
@@ -159,7 +164,7 @@ function App() {
 
   const [authToken, setAuthToken] = useState(() => {
     try {
-      return JSON.parse(localStorage.getItem("assetchain-session"))?.token || "";
+      return JSON.parse(sessionStorage.getItem("assetchain-session"))?.token || "";
     } catch {
       return "";
     }
@@ -167,11 +172,13 @@ function App() {
 
   const [loginUsername, setLoginUsername] = useState("");
   const [loginPassword, setLoginPassword] = useState("");
+  const [loginOtp, setLoginOtp] = useState("");
   const [loginLoading, setLoginLoading] = useState(false);
   const [firstLoginPassword, setFirstLoginPassword] = useState("");
   const [permissions, setPermissions] = useState([]);
   const [permissionConfig, setPermissionConfig] = useState(null);
   const [passwordResetRequests, setPasswordResetRequests] = useState([]);
+  const [fabricIdentityRequests, setFabricIdentityRequests] = useState([]);
   const [requestsLoading, setRequestsLoading] = useState(false);
   const [userTab, setUserTab] = useState("employees");
   const [editingUser, setEditingUser] = useState(null);
@@ -205,6 +212,10 @@ function App() {
   const isCustomer = currentRole === "customer";
   const can = (permission) => isAdmin || permissions.includes(permission);
   const pendingResetCount = passwordResetRequests.filter((item) => item.status === "pending").length;
+  const pendingIdentityCount = fabricIdentityRequests.filter(
+    (item) => item.status === "pending" || item.status === "failed"
+  ).length;
+  const pendingRequestCount = pendingResetCount + pendingIdentityCount;
 
   useEffect(() => {
     try {
@@ -253,7 +264,7 @@ useEffect(() => {
     functionName,
     args = []
   ) => {
-    const response = await fetch(
+    const response = await apiFetch(
       `${API_URL}/api/chaincode/invoke`,
       {
         method: "POST",
@@ -262,7 +273,8 @@ useEffect(() => {
           "Content-Type":
             "application/json",
 
-          Authorization: `Bearer ${authToken}`,
+          "X-CSRF-Token": authToken,
+          "Idempotency-Key": crypto.randomUUID(),
         },
 
         body: JSON.stringify({
@@ -307,11 +319,14 @@ useEffect(() => {
   };
 
   const apiRequest = async (path, options = {}) => {
-    const response = await fetch(`${API_URL}${path}`, {
+    const method = String(options.method || "GET").toUpperCase();
+    const isMutation = ["POST", "PUT", "PATCH", "DELETE"].includes(method);
+    const response = await apiFetch(`${API_URL}${path}`, {
       ...options,
       headers: {
         ...(options.body ? { "Content-Type": "application/json" } : {}),
-        Authorization: "Bearer " + authToken,
+        "X-CSRF-Token": authToken,
+        ...(isMutation ? { "Idempotency-Key": crypto.randomUUID() } : {}),
         ...(options.headers || {}),
       },
     });
@@ -321,7 +336,7 @@ useEffect(() => {
         setCurrentUser((current) => {
           if (!current) return current;
           const updated = { ...current, mustChangePassword: true };
-          localStorage.setItem(
+          sessionStorage.setItem(
             "assetchain-session",
             JSON.stringify({ user: updated, token: authToken })
           );
@@ -329,7 +344,7 @@ useEffect(() => {
         });
       }
       if (response.status === 401 || data.code === "SESSION_REVOKED") {
-        localStorage.removeItem("assetchain-session");
+        sessionStorage.removeItem("assetchain-session");
         setCurrentUser(null);
         setAuthToken("");
       }
@@ -428,14 +443,19 @@ useEffect(() => {
     }
   };
 
-  const loadPasswordResetRequests = async () => {
+  const loadAdminRequests = async () => {
     if (normalizeRole(currentUser?.role) !== "admin") return [];
     try {
       setRequestsLoading(true);
-      const data = await apiRequest("/api/password-reset-requests");
-      const items = Array.isArray(data.data) ? data.data : [];
-      setPasswordResetRequests(items);
-      return items;
+      const [passwordData, identityData] = await Promise.all([
+        apiRequest("/api/password-reset-requests"),
+        apiRequest("/api/fabric-identity-requests"),
+      ]);
+      const passwordItems = Array.isArray(passwordData.data) ? passwordData.data : [];
+      const identityItems = Array.isArray(identityData.data) ? identityData.data : [];
+      setPasswordResetRequests(passwordItems);
+      setFabricIdentityRequests(identityItems);
+      return [...passwordItems, ...identityItems];
     } finally {
       setRequestsLoading(false);
     }
@@ -451,9 +471,9 @@ useEffect(() => {
   const loadNetworks = async () => {
     try {
       const response =
-        await fetch(
+        await apiFetch(
           `${API_URL}/api/fabric/networks`,
-          { headers: { Authorization: `Bearer ${authToken}` } }
+          { headers: { "X-CSRF-Token": authToken } }
         );
 
       const data =
@@ -488,7 +508,7 @@ useEffect(() => {
         loadUsers(),
         isAdmin ? loadNetworks() : Promise.resolve(),
         loadPermissions(),
-        isAdmin ? loadPasswordResetRequests() : Promise.resolve(),
+        isAdmin ? loadAdminRequests() : Promise.resolve(),
       ]);
     } catch (error) {
       console.error(error);
@@ -895,19 +915,16 @@ useEffect(() => {
    * =====================================================
    */
 
-  const createUserRecord = async (form) => {
-    const response = await apiRequest("/api/users", {
-      method: "POST",
-      body: JSON.stringify({
-        id: form.id?.trim() || "",
-        username: form.username.trim(),
-        fullName: form.fullName.trim(),
-        role: form.role,
-        contact: form.contact?.trim() || "",
-      }),
-    });
-    return response.data;
-  };
+  const createUserRecord = async (form) => apiRequest("/api/users", {
+    method: "POST",
+    body: JSON.stringify({
+      id: form.id?.trim() || "",
+      username: form.username.trim(),
+      fullName: form.fullName.trim(),
+      role: form.role,
+      contact: form.contact?.trim() || "",
+    }),
+  });
 
   const createUser = async (form) => {
     const mayCreate = isAdmin || can("create_staff") || can("create_customer");
@@ -918,9 +935,13 @@ useEffect(() => {
 
     try {
       setLoading(true);
-      const created = await createUserRecord(form);
-      await loadUsers();
-      setNotice(`Đã tạo người dùng ${created?.id || form.username} trên Blockchain`);
+      const response = await createUserRecord(form);
+      const created = response.data;
+      await Promise.all([
+        loadUsers(),
+        isAdmin ? loadAdminRequests() : Promise.resolve(),
+      ]);
+      setNotice(response.message || `Đã tạo người dùng ${created?.id || form.username} trên Blockchain`);
       setModal(null);
     } catch (error) {
       console.error(error);
@@ -947,7 +968,7 @@ useEffect(() => {
       if (editingUser.id === currentUser?.id) {
         const updatedUser = { ...currentUser, ...response.data };
         setCurrentUser(updatedUser);
-        localStorage.setItem("assetchain-session", JSON.stringify({ user: updatedUser, token: authToken }));
+        sessionStorage.setItem("assetchain-session", JSON.stringify({ user: updatedUser, token: authToken }));
       }
       await loadUsers();
       setEditingUser(null);
@@ -969,9 +990,12 @@ useEffect(() => {
   const executeDeleteUser = async (user) => {
     try {
       setLoading(true);
-      const response = await fetch(`${API_URL}/api/users/${encodeURIComponent(user.id)}`, {
+      const response = await apiFetch(`${API_URL}/api/users/${encodeURIComponent(user.id)}`, {
         method: "DELETE",
-        headers: { Authorization: "Bearer " + authToken },
+        headers: {
+          "X-CSRF-Token": authToken,
+          "Idempotency-Key": crypto.randomUUID(),
+        },
       });
       const result = await response.json();
       if (!response.ok) {
@@ -1351,23 +1375,24 @@ useEffect(() => {
     try {
       setLoginLoading(true);
       const enteredPassword = loginPassword;
-      const response = await fetch(`${API_URL}/api/auth/login`, {
+      const response = await apiFetch(`${API_URL}/api/auth/login`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ username, password: enteredPassword }),
+        body: JSON.stringify({ username, password: enteredPassword, otp: loginOtp.trim() }),
       });
       const payload = await response.json();
       if (!response.ok) {
         throw new Error(payload.message || "Đăng nhập thất bại");
       }
-      const { user, token } = payload.data;
+      const { user, csrfToken } = payload.data;
 
       setCurrentUser(user);
-      setAuthToken(token);
+      setAuthToken(csrfToken);
       setFirstLoginPassword(user.mustChangePassword ? enteredPassword : "");
-      localStorage.setItem("assetchain-session", JSON.stringify({ user, token }));
+      sessionStorage.setItem("assetchain-session", JSON.stringify({ user, token: csrfToken }));
       setLoginUsername("");
       setLoginPassword("");
+      setLoginOtp("");
       setPage("dashboard");
     } catch (error) {
       console.error(error);
@@ -1390,7 +1415,7 @@ useEffect(() => {
       onConfirm: async () => {
         try {
           setLoginLoading(true);
-          const response = await fetch(`${API_URL}/api/auth/password-reset-requests`, {
+          const response = await apiFetch(`${API_URL}/api/auth/password-reset-requests`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ username }),
@@ -1411,21 +1436,22 @@ useEffect(() => {
   const changeCurrentPassword = async ({ currentPassword, newPassword }) => {
     try {
       setLoading(true);
-      const response = await fetch(`${API_URL}/api/auth/change-password`, {
+      const response = await apiFetch(`${API_URL}/api/auth/change-password`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          Authorization: `Bearer ${authToken}`,
+          "X-CSRF-Token": authToken,
+          "Idempotency-Key": crypto.randomUUID(),
         },
         body: JSON.stringify({ currentPassword, newPassword }),
       });
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.message || "Không thể đổi mật khẩu");
-      const { user, token } = payload.data;
+      const { user, csrfToken } = payload.data;
       setCurrentUser(user);
-      setAuthToken(token);
+      setAuthToken(csrfToken);
       setFirstLoginPassword("");
-      localStorage.setItem("assetchain-session", JSON.stringify({ user, token }));
+      sessionStorage.setItem("assetchain-session", JSON.stringify({ user, token: csrfToken }));
       setNotice("Đổi mật khẩu thành công");
       setPage("dashboard");
     } catch (error) {
@@ -1435,8 +1461,16 @@ useEffect(() => {
     }
   };
 
-  const logout = () => {
-    localStorage.removeItem("assetchain-session");
+  const logout = async () => {
+    try {
+      await apiFetch(`${API_URL}/api/auth/logout`, {
+        method: "POST",
+        headers: { "X-CSRF-Token": authToken },
+      });
+    } catch {
+      // Local cleanup still prevents the UI from retaining authenticated state.
+    }
+    sessionStorage.removeItem("assetchain-session");
     setCurrentUser(null);
     setAuthToken("");
     setFirstLoginPassword("");
@@ -1444,6 +1478,7 @@ useEffect(() => {
     setUsers([]);
     setNetwork(null);
     setPasswordResetRequests([]);
+    setFabricIdentityRequests([]);
     setSelected(null);
     setEditing(null);
     setModal(null);
@@ -1994,11 +2029,41 @@ useEffect(() => {
             `/api/password-reset-requests/${encodeURIComponent(item.id)}/${decision}`,
             { method: "POST" }
           );
-          await loadPasswordResetRequests();
+          await loadAdminRequests();
           setNotice(response.message);
           setConfirmDialog(null);
         } catch (error) {
           setNotice(error.message);
+        } finally {
+          setLoading(false);
+        }
+      },
+    });
+  };
+
+  const reviewFabricIdentityRequest = (item, decision) => {
+    const approving = decision === "approve";
+    setConfirmDialog({
+      title: approving ? "Cấp Fabric identity" : "Từ chối cấp Fabric identity",
+      message: approving
+        ? `Tự động tạo và bind Fabric client identity cho ${item.username || item.userID}?\n\nUser chỉ đăng nhập được sau khi identity chuyển sang trạng thái hoạt động.`
+        : `Từ chối yêu cầu cấp Fabric identity cho ${item.username || item.userID}?`,
+      confirmText: approving ? (item.status === "failed" ? "Thử lại" : "Cấp identity") : "Từ chối",
+      danger: !approving,
+      onConfirm: async () => {
+        try {
+          setLoading(true);
+          const response = await apiRequest(
+            `/api/fabric-identity-requests/${encodeURIComponent(item.id)}/${decision}`,
+            { method: "POST" }
+          );
+          await loadAdminRequests();
+          setNotice(response.message);
+          setConfirmDialog(null);
+        } catch (error) {
+          await loadAdminRequests();
+          setNotice(error.message);
+          setConfirmDialog(null);
         } finally {
           setLoading(false);
         }
@@ -2033,19 +2098,75 @@ useEffect(() => {
   };
 
   const renderRequests = () => {
-    const pendingCount = passwordResetRequests.filter((item) => item.status === "pending").length;
+    const identityStatusLabel = (status) => ({
+      pending: "Chờ xử lý",
+      processing: "Đang cấp",
+      approved: "Đã kích hoạt",
+      rejected: "Đã từ chối",
+      failed: "Cấp thất bại",
+    }[status] || status);
     return (
       <>
         <div className="page-toolbar">
           <div>
-            <h2>Yêu cầu đặt lại mật khẩu</h2>
-            <p>{pendingCount} yêu cầu đang chờ Admin xử lý</p>
+            <h2>Yêu cầu quản trị</h2>
+            <p>{pendingRequestCount} yêu cầu cần Admin xử lý</p>
           </div>
-          <button className="secondary-button" onClick={loadPasswordResetRequests} disabled={requestsLoading}>
+          <button className="secondary-button" onClick={loadAdminRequests} disabled={requestsLoading}>
             {requestsLoading ? "Đang tải..." : "↻ Làm mới"}
           </button>
         </div>
 
+        <h3>Cấp Fabric identity</h3>
+        <div className="table-card" style={{ marginBottom: "28px" }}>
+          <table>
+            <thead>
+              <tr>
+                <th>NGƯỜI DÙNG</th>
+                <th>NGƯỜI TẠO</th>
+                <th>THỜI GIAN GỬI</th>
+                <th>TRẠNG THÁI</th>
+                <th>XỬ LÝ</th>
+              </tr>
+            </thead>
+            <tbody>
+              {fabricIdentityRequests.length ? fabricIdentityRequests.map((item) => (
+                <tr key={item.id}>
+                  <td>
+                    <strong>{item.username || item.userID}</strong>
+                    <div className="muted">{item.fullName || item.userID} · {item.role || "-"}</div>
+                    {item.lastError && <div className="muted" title={item.lastError}>Lỗi: {item.lastError}</div>}
+                  </td>
+                  <td>{item.requestedBy || "-"}</td>
+                  <td>{item.requestedAt ? new Date(item.requestedAt).toLocaleString("vi-VN") : "-"}</td>
+                  <td>
+                    <span className={`request-status ${item.status}`}>
+                      {identityStatusLabel(item.status)}
+                    </span>
+                  </td>
+                  <td>
+                    {["pending", "failed"].includes(item.status) ? (
+                      <div className="request-actions">
+                        <button className="primary-button" onClick={() => reviewFabricIdentityRequest(item, "approve")} disabled={loading}>
+                          {item.status === "failed" ? "Thử lại" : "Cấp identity"}
+                        </button>
+                        <button className="danger-button" onClick={() => reviewFabricIdentityRequest(item, "reject")} disabled={loading}>
+                          Từ chối
+                        </button>
+                      </div>
+                    ) : (
+                      <span className="muted">Đã xử lý</span>
+                    )}
+                  </td>
+                </tr>
+              )) : (
+                <tr><td colSpan="5" className="empty">Chưa có yêu cầu cấp Fabric identity</td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Đặt lại mật khẩu</h3>
         <div className="table-card">
           <table>
             <thead>
@@ -2371,6 +2492,24 @@ useEffect(() => {
             />
           </div>
 
+          <div style={{ width: "100%", marginTop: "14px" }}>
+            <input
+              inputMode="numeric"
+              autoComplete="one-time-code"
+              maxLength={6}
+              value={loginOtp}
+              onChange={(event) => setLoginOtp(event.target.value.replace(/\D/g, ""))}
+              placeholder="Mã MFA 6 số (nếu đã bật)"
+              aria-label="Mã MFA"
+              style={{
+                display: "block", width: "100%", height: "52px",
+                boxSizing: "border-box", padding: "0 16px",
+                border: "1px solid #d1d5db", borderRadius: "10px",
+                background: "#f9fafb", color: "#111827", fontSize: "16px",
+              }}
+            />
+          </div>
+
           <button
             className="primary-button"
             type="submit"
@@ -2462,7 +2601,7 @@ useEffect(() => {
             ["assets", "package", "Tài sản"],
             ...(canAccessUsers ? [["users", "users", "Nhân sự & người dùng"]] : []),
             ...(can("view_history") ? [["transactions", "history", "Lịch sử giao dịch"]] : []),
-            ...(isAdmin ? [["requests", "mail", `Yêu cầu${pendingResetCount ? ` (${pendingResetCount})` : ""}`]] : []),
+            ...(isAdmin ? [["requests", "mail", `Yêu cầu${pendingRequestCount ? ` (${pendingRequestCount})` : ""}`]] : []),
             ...(isAdmin ? [["permissions", "shield-check", "Phân quyền"]] : []),
           ].map(
             ([

@@ -1,21 +1,85 @@
 package main
 
 import (
+	"crypto/sha256"
+	"crypto/x509"
 	"encoding/json"
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/hyperledger/fabric-chaincode-go/shimtest"
 	"github.com/hyperledger/fabric-contract-api-go/contractapi"
 )
 
-func newTestContext(t *testing.T) (*contractapi.TransactionContext, *shimtest.MockStub) {
+type privateDataMockStub struct {
+	*shimtest.MockStub
+}
+
+type testClientIdentity struct {
+	mspID string
+	cert  *x509.Certificate
+}
+
+func (identity *testClientIdentity) GetID() (string, error)    { return "test-id", nil }
+func (identity *testClientIdentity) GetMSPID() (string, error) { return identity.mspID, nil }
+func (identity *testClientIdentity) GetAttributeValue(string) (string, bool, error) {
+	return "", false, nil
+}
+func (identity *testClientIdentity) AssertAttributeValue(string, string) error {
+	return fmt.Errorf("attribute unavailable")
+}
+func (identity *testClientIdentity) GetX509Certificate() (*x509.Certificate, error) {
+	return identity.cert, nil
+}
+
+func (stub *privateDataMockStub) DelPrivateData(collection string, key string) error {
+	if values := stub.PvtState[collection]; values != nil {
+		delete(values, key)
+	}
+	return nil
+}
+
+func newTestContext(t *testing.T) (*contractapi.TransactionContext, *privateDataMockStub) {
 	t.Helper()
-	stub := shimtest.NewMockStub("assetcc", nil)
+	t.Setenv("USER_CREDENTIAL_PDC_ENABLED", "true")
+	stub := &privateDataMockStub{shimtest.NewMockStub("assetcc", nil)}
 	stub.MockTransactionStart("tx-1")
 	context := new(contractapi.TransactionContext)
 	context.SetStub(stub)
+	certificate := &x509.Certificate{Raw: []byte("assetchain-test-certificate")}
+	context.SetClientIdentity(&testClientIdentity{mspID: "Org1MSP", cert: certificate})
+	fingerprint := fmt.Sprintf("%x", sha256.Sum256(certificate.Raw))
+	for _, actorID := range []string{"SYSTEM", "A001", "U001", "U100", "C001", "S001", "W001", "M001"} {
+		binding, err := json.Marshal(FabricIdentityBinding{
+			UserID: actorID, MSPID: "Org1MSP", CertificateFingerprint: fingerprint,
+		})
+		if err != nil {
+			t.Fatalf("failed to create test binding: %v", err)
+		}
+		stub.State[identityBindingKey(actorID)] = binding
+	}
 	t.Cleanup(func() { stub.MockTransactionEnd("tx-1") })
 	return context, stub
+}
+
+func TestCredentialCompatibilityModeUsesWorldState(t *testing.T) {
+	context, stub := newTestContext(t)
+	t.Setenv("USER_CREDENTIAL_PDC_ENABLED", "false")
+	credential := UserCredential{Username: "legacy-mode", PasswordHash: "hash"}
+	data, err := json.Marshal(credential)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := putCredentialState(context, "AUTH_legacy-mode", data); err != nil {
+		t.Fatalf("putCredentialState returned an error: %v", err)
+	}
+	if stub.State["AUTH_legacy-mode"] == nil {
+		t.Fatal("compatibility mode did not use world state")
+	}
+	if stub.PvtState[credentialCollection]["AUTH_legacy-mode"] != nil {
+		t.Fatal("compatibility mode unexpectedly wrote private data")
+	}
 }
 
 func TestCreateUserStoresCredentialSeparately(t *testing.T) {
@@ -35,10 +99,16 @@ func TestCreateUserStoresCredentialSeparately(t *testing.T) {
 	if _, exposed := user["passwordHash"]; exposed {
 		t.Fatal("public user record exposed passwordHash")
 	}
+	if stub.State["AUTH_alice"] != nil {
+		t.Fatal("credential hash was written to public world state")
+	}
+	if stub.PvtState[credentialCollection]["AUTH_alice"] == nil {
+		t.Fatal("credential hash was not written to the private collection")
+	}
 	if user["contact"] != "alice@example.com" || user["createdBy"] != "A001" {
 		t.Fatalf("unexpected public profile metadata: %#v", user)
 	}
-	if err := contract.UpdateUser(context, "U100", "Alice Updated", "CUSTOMER", "0900000000"); err != nil {
+	if err := contract.UpdateUser(context, "U100", "Alice Updated", "CUSTOMER", "0900000000", "A001"); err != nil {
 		t.Fatalf("UpdateUser returned an error: %v", err)
 	}
 	updated, err := contract.GetUser(context, "U100")
@@ -70,6 +140,26 @@ func TestCreateUserRejectsDuplicateUsernameIgnoringCase(t *testing.T) {
 	}
 }
 
+func TestMigrateLegacyCredentialToPrivateData(t *testing.T) {
+	context, stub := newTestContext(t)
+	contract := new(SmartContract)
+	stub.State["AUTH_legacy"] = []byte(`{"username":"legacy","passwordHash":"hash"}`)
+
+	if err := contract.MigrateUserCredential(context, "legacy", "A001"); err != nil {
+		t.Fatalf("MigrateUserCredential returned an error: %v", err)
+	}
+	if stub.State["AUTH_legacy"] != nil {
+		t.Fatal("legacy credential remains in public world state")
+	}
+	if string(stub.PvtState[credentialCollection]["AUTH_legacy"]) == "" {
+		t.Fatal("credential was not copied to private data")
+	}
+	passwordHash, err := contract.GetPasswordHash(context, "legacy")
+	if err != nil || passwordHash != "hash" {
+		t.Fatalf("private credential unavailable after migration: %q, %v", passwordHash, err)
+	}
+}
+
 func TestDeleteUserRemovesProfileAndCredential(t *testing.T) {
 	context, stub := newTestContext(t)
 	contract := new(SmartContract)
@@ -80,10 +170,11 @@ func TestDeleteUserRemovesProfileAndCredential(t *testing.T) {
 		t.Fatalf("failed to create user: %v", err)
 	}
 
-	if err := contract.DeleteUser(context, "U100"); err != nil {
+	if err := contract.DeleteUser(context, "U100", "A001"); err != nil {
 		t.Fatalf("DeleteUser returned an error: %v", err)
 	}
-	if stub.State["USER_U100"] != nil || stub.State["AUTH_alice"] != nil {
+	if stub.State["USER_U100"] != nil || stub.State["AUTH_alice"] != nil ||
+		stub.PvtState[credentialCollection]["AUTH_alice"] != nil {
 		t.Fatal("user profile or credential remains after deletion")
 	}
 }
@@ -101,10 +192,10 @@ func TestDeleteUserRejectsOwnedAssetsAndLastAdmin(t *testing.T) {
 		t.Fatalf("failed to create asset: %v", err)
 	}
 
-	if err := contract.DeleteUser(context, "U100"); err == nil {
+	if err := contract.DeleteUser(context, "U100", "A001"); err == nil {
 		t.Fatal("expected user with assets to be rejected")
 	}
-	if err := contract.DeleteUser(context, "A001"); err == nil {
+	if err := contract.DeleteUser(context, "A001", "A001"); err == nil {
 		t.Fatal("expected last admin deletion to be rejected")
 	}
 }
@@ -209,5 +300,88 @@ func TestLegacyAssetDefaultsToQuantityOne(t *testing.T) {
 	}
 	if asset.Quantity != 1 {
 		t.Fatalf("expected legacy quantity 1, got %d", asset.Quantity)
+	}
+}
+
+func TestMutationRejectsActorWhoseCertificateDoesNotMatch(t *testing.T) {
+	context, _ := newTestContext(t)
+	contract := new(SmartContract)
+	if err := contract.CreateUser(context, "U200", "user200", "User 200", "CUSTOMER", "hash", "", "A001"); err != nil {
+		t.Fatalf("failed to create test user: %v", err)
+	}
+	context.SetClientIdentity(&testClientIdentity{
+		mspID: "Org1MSP", cert: &x509.Certificate{Raw: []byte("different-certificate")},
+	})
+	if err := contract.UpdateUser(context, "U200", "Changed", "CUSTOMER", "", "A001"); err == nil {
+		t.Fatal("expected mismatched invoker certificate to be rejected")
+	}
+	user, err := contract.GetUser(context, "U200")
+	if err != nil || user.FullName != "User 200" {
+		t.Fatalf("rejected mutation changed state: %#v, %v", user, err)
+	}
+}
+
+func TestAdminRegistersUniqueUserIdentity(t *testing.T) {
+	context, _ := newTestContext(t)
+	contract := new(SmartContract)
+	if err := contract.CreateUser(context, "A001", "admin", "Admin", "ADMIN", "hash", "", "A001"); err != nil {
+		t.Fatalf("failed to create admin: %v", err)
+	}
+	if err := contract.CreateUser(context, "C200", "customer200", "Customer", "CUSTOMER", "hash", "", "A001"); err != nil {
+		t.Fatalf("failed to create customer: %v", err)
+	}
+	if err := contract.CreateUser(context, "C201", "customer201", "Customer 2", "CUSTOMER", "hash", "", "A001"); err != nil {
+		t.Fatalf("failed to create second customer: %v", err)
+	}
+	fingerprint := strings.Repeat("b", 64)
+	if err := contract.RegisterUserIdentity(context, "C200", "Org1MSP", fingerprint, "A001"); err != nil {
+		t.Fatalf("RegisterUserIdentity returned an error: %v", err)
+	}
+	binding, err := contract.GetUserIdentity(context, "C200")
+	if err != nil || binding.CertificateFingerprint != fingerprint || binding.BoundBy != "A001" {
+		t.Fatalf("unexpected identity binding: %#v, %v", binding, err)
+	}
+	if err := contract.RegisterUserIdentity(context, "C201", "Org1MSP", fingerprint, "A001"); err == nil {
+		t.Fatal("expected duplicate certificate binding to be rejected")
+	}
+}
+
+func TestBootstrapIsDisabledWithoutExplicitAllowlist(t *testing.T) {
+	context, _ := newTestContext(t)
+	contract := new(SmartContract)
+	if err := contract.CreateUser(context, "U001", "admin", "Admin", "ADMIN", "hash", "", "A001"); err != nil {
+		t.Fatalf("failed to create admin: %v", err)
+	}
+	t.Setenv("IDENTITY_BOOTSTRAP_USER_ID", "")
+	t.Setenv("IDENTITY_BOOTSTRAP_MSP_ID", "")
+	t.Setenv("IDENTITY_BOOTSTRAP_CERT_FINGERPRINT", "")
+	if err := contract.BootstrapAdminIdentity(context, "U001"); err == nil {
+		t.Fatal("expected bootstrap to be disabled by default")
+	}
+}
+
+func TestBootstrapBindsAllowlistedAdminExactlyOnce(t *testing.T) {
+	context, stub := newTestContext(t)
+	contract := new(SmartContract)
+	if err := contract.CreateUser(context, "U001", "admin", "Admin", "ADMIN", "hash", "", "A001"); err != nil {
+		t.Fatalf("failed to create admin: %v", err)
+	}
+	delete(stub.State, identityBindingKey("U001"))
+	certificate, err := context.GetClientIdentity().GetX509Certificate()
+	if err != nil {
+		t.Fatalf("failed to read test certificate: %v", err)
+	}
+	fingerprint := fmt.Sprintf("%x", sha256.Sum256(certificate.Raw))
+	t.Setenv("IDENTITY_BOOTSTRAP_USER_ID", "U001")
+	t.Setenv("IDENTITY_BOOTSTRAP_MSP_ID", "Org1MSP")
+	t.Setenv("IDENTITY_BOOTSTRAP_CERT_FINGERPRINT", fingerprint)
+	if err := contract.BootstrapAdminIdentity(context, "U001"); err != nil {
+		t.Fatalf("BootstrapAdminIdentity returned an error: %v", err)
+	}
+	if _, err := contract.GetUserIdentity(context, "U001"); err != nil {
+		t.Fatalf("bootstrap binding was not stored: %v", err)
+	}
+	if err := contract.BootstrapAdminIdentity(context, "U001"); err == nil {
+		t.Fatal("expected second bootstrap to be rejected")
 	}
 }

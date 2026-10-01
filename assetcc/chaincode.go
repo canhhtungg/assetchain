@@ -1,8 +1,10 @@
 package main
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -11,6 +13,41 @@ import (
 
 type SmartContract struct {
 	contractapi.Contract
+}
+
+const credentialCollection = "userCredentials"
+
+func credentialPrivateDataEnabled() bool {
+	return strings.EqualFold(strings.TrimSpace(os.Getenv("USER_CREDENTIAL_PDC_ENABLED")), "true")
+}
+
+func getCredentialState(ctx contractapi.TransactionContextInterface, key string) ([]byte, error) {
+	if credentialPrivateDataEnabled() {
+		data, err := ctx.GetStub().GetPrivateData(credentialCollection, key)
+		if err != nil || data != nil {
+			return data, err
+		}
+	}
+	return ctx.GetStub().GetState(key)
+}
+
+func putCredentialState(ctx contractapi.TransactionContextInterface, key string, data []byte) error {
+	if credentialPrivateDataEnabled() {
+		if err := ctx.GetStub().PutPrivateData(credentialCollection, key, data); err != nil {
+			return err
+		}
+		return ctx.GetStub().DelState(key)
+	}
+	return ctx.GetStub().PutState(key, data)
+}
+
+func deleteCredentialState(ctx contractapi.TransactionContextInterface, key string) error {
+	if credentialPrivateDataEnabled() {
+		if err := ctx.GetStub().DelPrivateData(credentialCollection, key); err != nil {
+			return err
+		}
+	}
+	return ctx.GetStub().DelState(key)
 }
 
 // ================================
@@ -31,6 +68,143 @@ type User struct {
 type UserCredential struct {
 	Username     string `json:"username"`
 	PasswordHash string `json:"passwordHash"`
+}
+
+// FabricIdentityBinding binds an application user to the certificate that must
+// sign their mutations. Only public certificate metadata is stored on-ledger.
+type FabricIdentityBinding struct {
+	UserID                 string `json:"userID"`
+	MSPID                  string `json:"mspID"`
+	CertificateFingerprint string `json:"certificateFingerprint"`
+	BoundBy                string `json:"boundBy"`
+	BoundAt                string `json:"boundAt"`
+}
+
+const identityBootstrapMarker = "IDENTITY_BOOTSTRAP_COMPLETE"
+
+func identityBindingKey(userID string) string {
+	return "IDENTITY_BINDING_" + strings.TrimSpace(userID)
+}
+
+func identityFingerprintKey(mspID string, fingerprint string) string {
+	digest := sha256.Sum256([]byte(strings.TrimSpace(mspID) + "\x00" + strings.ToLower(strings.TrimSpace(fingerprint))))
+	return fmt.Sprintf("IDENTITY_FINGERPRINT_%x", digest[:])
+}
+
+func invokerIdentity(ctx contractapi.TransactionContextInterface) (string, string, error) {
+	identity := ctx.GetClientIdentity()
+	if identity == nil {
+		return "", "", fmt.Errorf("invoker Fabric identity is unavailable")
+	}
+	mspID, err := identity.GetMSPID()
+	if err != nil || strings.TrimSpace(mspID) == "" {
+		return "", "", fmt.Errorf("cannot determine invoker MSPID")
+	}
+	certificate, err := identity.GetX509Certificate()
+	if err != nil || certificate == nil || len(certificate.Raw) == 0 {
+		return "", "", fmt.Errorf("invoker must use an X.509 certificate")
+	}
+	fingerprint := sha256.Sum256(certificate.Raw)
+	return strings.TrimSpace(mspID), fmt.Sprintf("%x", fingerprint[:]), nil
+}
+
+func (s *SmartContract) verifyMutationActor(ctx contractapi.TransactionContextInterface, actorID string) error {
+	actorID = strings.TrimSpace(actorID)
+	if actorID == "" {
+		return fmt.Errorf("actorID is required")
+	}
+	data, err := ctx.GetStub().GetState(identityBindingKey(actorID))
+	if err != nil {
+		return err
+	}
+	if data == nil {
+		return fmt.Errorf("Fabric identity is not bound for actor %s", actorID)
+	}
+	var binding FabricIdentityBinding
+	if err := json.Unmarshal(data, &binding); err != nil {
+		return err
+	}
+	mspID, fingerprint, err := invokerIdentity(ctx)
+	if err != nil {
+		return err
+	}
+	if !strings.EqualFold(binding.MSPID, mspID) ||
+		!strings.EqualFold(binding.CertificateFingerprint, fingerprint) {
+		return fmt.Errorf("actor %s does not match invoker Fabric identity", actorID)
+	}
+	return nil
+}
+
+func transactionTime(ctx contractapi.TransactionContextInterface) string {
+	if timestamp, err := ctx.GetStub().GetTxTimestamp(); err == nil && timestamp != nil {
+		return timestamp.AsTime().UTC().Format(time.RFC3339)
+	}
+	return ""
+}
+
+func (s *SmartContract) putIdentityBinding(
+	ctx contractapi.TransactionContextInterface,
+	userID string,
+	mspID string,
+	fingerprint string,
+	boundBy string,
+	replace bool,
+) error {
+	userID = strings.TrimSpace(userID)
+	mspID = strings.TrimSpace(mspID)
+	fingerprint = strings.ToLower(strings.TrimSpace(fingerprint))
+	if userID == "" || mspID == "" || len(fingerprint) != 64 {
+		return fmt.Errorf("userID, MSPID and SHA-256 certificate fingerprint are required")
+	}
+	for _, character := range fingerprint {
+		if !strings.ContainsRune("0123456789abcdef", character) {
+			return fmt.Errorf("certificate fingerprint must be lowercase hexadecimal SHA-256")
+		}
+	}
+	userExists, err := s.UserExists(ctx, userID)
+	if err != nil {
+		return err
+	}
+	if !userExists {
+		return fmt.Errorf("user %s does not exist", userID)
+	}
+	key := identityBindingKey(userID)
+	existing, err := ctx.GetStub().GetState(key)
+	if err != nil {
+		return err
+	}
+	if existing != nil && !replace {
+		return fmt.Errorf("Fabric identity already exists for user %s", userID)
+	}
+	reverseKey := identityFingerprintKey(mspID, fingerprint)
+	assignedUser, err := ctx.GetStub().GetState(reverseKey)
+	if err != nil {
+		return err
+	}
+	if assignedUser != nil && string(assignedUser) != userID {
+		return fmt.Errorf("Fabric identity is already bound to another user")
+	}
+	if existing != nil && replace {
+		var old FabricIdentityBinding
+		if err := json.Unmarshal(existing, &old); err != nil {
+			return err
+		}
+		if err := ctx.GetStub().DelState(identityFingerprintKey(old.MSPID, old.CertificateFingerprint)); err != nil {
+			return err
+		}
+	}
+	binding := FabricIdentityBinding{
+		UserID: userID, MSPID: mspID, CertificateFingerprint: fingerprint,
+		BoundBy: strings.TrimSpace(boundBy), BoundAt: transactionTime(ctx),
+	}
+	data, err := json.Marshal(binding)
+	if err != nil {
+		return err
+	}
+	if err := ctx.GetStub().PutState(key, data); err != nil {
+		return err
+	}
+	return ctx.GetStub().PutState(reverseKey, []byte(userID))
 }
 
 // ================================
@@ -67,6 +241,118 @@ type AssetHistory struct {
 // USER FUNCTIONS
 // ================================
 
+// BootstrapAdminIdentity performs the one-time transition from a legacy
+// ledger. It is disabled unless all three allowlist environment variables are
+// configured on every chaincode peer and the invoking certificate matches.
+func (s *SmartContract) BootstrapAdminIdentity(
+	ctx contractapi.TransactionContextInterface,
+	userID string,
+) error {
+	expectedUser := strings.TrimSpace(os.Getenv("IDENTITY_BOOTSTRAP_USER_ID"))
+	expectedMSP := strings.TrimSpace(os.Getenv("IDENTITY_BOOTSTRAP_MSP_ID"))
+	expectedFingerprint := strings.ToLower(strings.TrimSpace(os.Getenv("IDENTITY_BOOTSTRAP_CERT_FINGERPRINT")))
+	if expectedUser == "" || expectedMSP == "" || expectedFingerprint == "" {
+		return fmt.Errorf("identity bootstrap is disabled")
+	}
+	if strings.TrimSpace(userID) != expectedUser {
+		return fmt.Errorf("bootstrap user is not allowlisted")
+	}
+	marker, err := ctx.GetStub().GetState(identityBootstrapMarker)
+	if err != nil {
+		return err
+	}
+	if marker != nil {
+		return fmt.Errorf("identity bootstrap is already complete")
+	}
+	user, err := s.GetUser(ctx, userID)
+	if err != nil {
+		return err
+	}
+	if !strings.EqualFold(user.Role, "admin") {
+		return fmt.Errorf("bootstrap user must have the admin role")
+	}
+	mspID, fingerprint, err := invokerIdentity(ctx)
+	if err != nil {
+		return err
+	}
+	if !strings.EqualFold(mspID, expectedMSP) ||
+		!strings.EqualFold(fingerprint, expectedFingerprint) {
+		return fmt.Errorf("invoker Fabric identity is not bootstrap-allowlisted")
+	}
+	if err := s.putIdentityBinding(ctx, userID, mspID, fingerprint, userID, false); err != nil {
+		return err
+	}
+	return ctx.GetStub().PutState(identityBootstrapMarker, []byte(userID))
+}
+
+// RegisterUserIdentity lets an already-bound admin bind a user certificate.
+func (s *SmartContract) RegisterUserIdentity(
+	ctx contractapi.TransactionContextInterface,
+	userID string,
+	mspID string,
+	certificateFingerprint string,
+	actorID string,
+) error {
+	if err := s.verifyMutationActor(ctx, actorID); err != nil {
+		return err
+	}
+	actor, err := s.GetUser(ctx, actorID)
+	if err != nil {
+		return err
+	}
+	if !strings.EqualFold(actor.Role, "admin") {
+		return fmt.Errorf("only an admin may register Fabric identities")
+	}
+	return s.putIdentityBinding(ctx, userID, mspID, certificateFingerprint, actorID, false)
+}
+
+// RotateUserIdentity replaces a binding; no compatibility bypass is retained.
+func (s *SmartContract) RotateUserIdentity(
+	ctx contractapi.TransactionContextInterface,
+	userID string,
+	mspID string,
+	certificateFingerprint string,
+	actorID string,
+) error {
+	if err := s.verifyMutationActor(ctx, actorID); err != nil {
+		return err
+	}
+	actor, err := s.GetUser(ctx, actorID)
+	if err != nil {
+		return err
+	}
+	if !strings.EqualFold(actor.Role, "admin") {
+		return fmt.Errorf("only an admin may rotate Fabric identities")
+	}
+	existing, err := ctx.GetStub().GetState(identityBindingKey(userID))
+	if err != nil {
+		return err
+	}
+	if existing == nil {
+		return fmt.Errorf("Fabric identity does not exist for user %s", userID)
+	}
+	return s.putIdentityBinding(ctx, userID, mspID, certificateFingerprint, actorID, true)
+}
+
+// GetUserIdentity returns public binding metadata for reconciliation.
+func (s *SmartContract) GetUserIdentity(
+	ctx contractapi.TransactionContextInterface,
+	userID string,
+) (*FabricIdentityBinding, error) {
+	data, err := ctx.GetStub().GetState(identityBindingKey(userID))
+	if err != nil {
+		return nil, err
+	}
+	if data == nil {
+		return nil, fmt.Errorf("Fabric identity does not exist for user %s", userID)
+	}
+	var binding FabricIdentityBinding
+	if err := json.Unmarshal(data, &binding); err != nil {
+		return nil, err
+	}
+	return &binding, nil
+}
+
 // CreateUser creates a new user.
 func (s *SmartContract) CreateUser(
 	ctx contractapi.TransactionContextInterface,
@@ -78,6 +364,9 @@ func (s *SmartContract) CreateUser(
 	contact string,
 	createdBy string,
 ) error {
+	if err := s.verifyMutationActor(ctx, createdBy); err != nil {
+		return err
+	}
 	username = strings.TrimSpace(username)
 	passwordHash = strings.TrimSpace(passwordHash)
 	if username == "" || passwordHash == "" {
@@ -130,7 +419,7 @@ func (s *SmartContract) CreateUser(
 		return err
 	}
 
-	return ctx.GetStub().PutState("AUTH_"+strings.ToLower(username), credentialData)
+	return putCredentialState(ctx, "AUTH_"+strings.ToLower(username), credentialData)
 }
 
 // UpdateUser changes public profile fields while preserving credentials and provenance.
@@ -140,7 +429,11 @@ func (s *SmartContract) UpdateUser(
 	fullName string,
 	role string,
 	contact string,
+	actorID string,
 ) error {
+	if err := s.verifyMutationActor(ctx, actorID); err != nil {
+		return err
+	}
 	user, err := s.GetUser(ctx, id)
 	if err != nil {
 		return err
@@ -155,8 +448,7 @@ func (s *SmartContract) UpdateUser(
 	return ctx.GetStub().PutState("USER_"+id, data)
 }
 
-// EnsureStoreUser creates the non-login owner used for store inventory and buybacks.
-func (s *SmartContract) EnsureStoreUser(ctx contractapi.TransactionContextInterface) error {
+func (s *SmartContract) ensureStoreUser(ctx contractapi.TransactionContextInterface) error {
 	exists, err := s.UserExists(ctx, "STORE")
 	if err != nil {
 		return err
@@ -173,10 +465,19 @@ func (s *SmartContract) EnsureStoreUser(ctx contractapi.TransactionContextInterf
 	return ctx.GetStub().PutState("USER_STORE", data)
 }
 
+// EnsureStoreUser creates the non-login owner used for store inventory and buybacks.
+func (s *SmartContract) EnsureStoreUser(ctx contractapi.TransactionContextInterface, actorID string) error {
+	if err := s.verifyMutationActor(ctx, actorID); err != nil {
+		return err
+	}
+	return s.ensureStoreUser(ctx)
+}
+
 // UsernameExists checks whether a login name already has credentials.
 func (s *SmartContract) UsernameExists(ctx contractapi.TransactionContextInterface, username string) (bool, error) {
 	normalizedUsername := strings.TrimSpace(username)
-	data, err := ctx.GetStub().GetState("AUTH_" + strings.ToLower(normalizedUsername))
+	key := "AUTH_" + strings.ToLower(normalizedUsername)
+	data, err := getCredentialState(ctx, key)
 	if err != nil {
 		return false, err
 	}
@@ -212,7 +513,8 @@ func (s *SmartContract) GetUserByUsername(ctx contractapi.TransactionContextInte
 
 // GetPasswordHash returns the stored one-way hash for backend verification.
 func (s *SmartContract) GetPasswordHash(ctx contractapi.TransactionContextInterface, username string) (string, error) {
-	data, err := ctx.GetStub().GetState("AUTH_" + strings.ToLower(strings.TrimSpace(username)))
+	key := "AUTH_" + strings.ToLower(strings.TrimSpace(username))
+	data, err := getCredentialState(ctx, key)
 	if err != nil {
 		return "", err
 	}
@@ -228,7 +530,10 @@ func (s *SmartContract) GetPasswordHash(ctx contractapi.TransactionContextInterf
 }
 
 // SetUserPassword creates or replaces credentials for an existing user.
-func (s *SmartContract) SetUserPassword(ctx contractapi.TransactionContextInterface, userID string, passwordHash string) error {
+func (s *SmartContract) SetUserPassword(ctx contractapi.TransactionContextInterface, userID string, passwordHash string, actorID string) error {
+	if err := s.verifyMutationActor(ctx, actorID); err != nil {
+		return err
+	}
 	user, err := s.GetUser(ctx, userID)
 	if err != nil {
 		return err
@@ -242,11 +547,37 @@ func (s *SmartContract) SetUserPassword(ctx contractapi.TransactionContextInterf
 	if err != nil {
 		return err
 	}
-	return ctx.GetStub().PutState("AUTH_"+strings.ToLower(strings.TrimSpace(user.Username)), data)
+	key := "AUTH_" + strings.ToLower(strings.TrimSpace(user.Username))
+	return putCredentialState(ctx, key, data)
+}
+
+// MigrateUserCredential moves one legacy credential from world state to private data.
+func (s *SmartContract) MigrateUserCredential(ctx contractapi.TransactionContextInterface, username string, actorID string) error {
+	if !credentialPrivateDataEnabled() {
+		return fmt.Errorf("userCredentials private-data collection is not enabled")
+	}
+	if err := s.verifyMutationActor(ctx, actorID); err != nil {
+		return err
+	}
+	key := "AUTH_" + strings.ToLower(strings.TrimSpace(username))
+	legacy, err := ctx.GetStub().GetState(key)
+	if err != nil {
+		return err
+	}
+	if legacy == nil {
+		return nil
+	}
+	if err := ctx.GetStub().PutPrivateData(credentialCollection, key, legacy); err != nil {
+		return err
+	}
+	return ctx.GetStub().DelState(key)
 }
 
 // DeleteUser removes a user and their credentials when no assets depend on them.
-func (s *SmartContract) DeleteUser(ctx contractapi.TransactionContextInterface, id string) error {
+func (s *SmartContract) DeleteUser(ctx contractapi.TransactionContextInterface, id string, actorID string) error {
+	if err := s.verifyMutationActor(ctx, actorID); err != nil {
+		return err
+	}
 	user, err := s.GetUser(ctx, id)
 	if err != nil {
 		return err
@@ -276,8 +607,26 @@ func (s *SmartContract) DeleteUser(ctx contractapi.TransactionContextInterface, 
 		}
 	}
 
-	if err := ctx.GetStub().DelState("AUTH_" + strings.ToLower(strings.TrimSpace(user.Username))); err != nil {
+	credentialKey := "AUTH_" + strings.ToLower(strings.TrimSpace(user.Username))
+	if err := deleteCredentialState(ctx, credentialKey); err != nil {
 		return err
+	}
+	identityKey := identityBindingKey(id)
+	identityData, err := ctx.GetStub().GetState(identityKey)
+	if err != nil {
+		return err
+	}
+	if identityData != nil {
+		var binding FabricIdentityBinding
+		if err := json.Unmarshal(identityData, &binding); err != nil {
+			return err
+		}
+		if err := ctx.GetStub().DelState(identityFingerprintKey(binding.MSPID, binding.CertificateFingerprint)); err != nil {
+			return err
+		}
+		if err := ctx.GetStub().DelState(identityKey); err != nil {
+			return err
+		}
 	}
 	return ctx.GetStub().DelState("USER_" + id)
 }
@@ -339,11 +688,14 @@ func (s *SmartContract) CreateAsset(
 	quantity int,
 	actorID string,
 ) error {
+	if err := s.verifyMutationActor(ctx, actorID); err != nil {
+		return err
+	}
 	if quantity < 1 {
 		return fmt.Errorf("quantity must be at least 1")
 	}
 	if ownerID == "STORE" {
-		if err := s.EnsureStoreUser(ctx); err != nil {
+		if err := s.ensureStoreUser(ctx); err != nil {
 			return err
 		}
 	}
@@ -446,11 +798,14 @@ func (s *SmartContract) UpdateAsset(
 	quantity int,
 	actorID string,
 ) error {
+	if err := s.verifyMutationActor(ctx, actorID); err != nil {
+		return err
+	}
 	if quantity < 1 {
 		return fmt.Errorf("quantity must be at least 1")
 	}
 	if ownerID == "STORE" {
-		if err := s.EnsureStoreUser(ctx); err != nil {
+		if err := s.ensureStoreUser(ctx); err != nil {
 			return err
 		}
 	}
@@ -499,7 +854,11 @@ func (s *SmartContract) UpdateAsset(
 func (s *SmartContract) DeleteAsset(
 	ctx contractapi.TransactionContextInterface,
 	id string,
+	actorID string,
 ) error {
+	if err := s.verifyMutationActor(ctx, actorID); err != nil {
+		return err
+	}
 
 	exists, err := s.AssetExists(ctx, id)
 	if err != nil {
@@ -515,6 +874,7 @@ func (s *SmartContract) DeleteAsset(
 		return err
 	}
 	asset.Deleted = true
+	asset.LastActorID = strings.TrimSpace(actorID)
 	asset.LastOperation = "delete"
 	data, err := json.Marshal(asset)
 	if err != nil {
@@ -530,6 +890,9 @@ func (s *SmartContract) DeleteAssetQuantity(
 	quantity int,
 	actorID string,
 ) error {
+	if err := s.verifyMutationActor(ctx, actorID); err != nil {
+		return err
+	}
 	asset, err := s.ReadAsset(ctx, id)
 	if err != nil {
 		return err
@@ -582,8 +945,11 @@ func (s *SmartContract) TransferAsset(
 	newOwnerID string,
 	actorID string,
 ) error {
+	if err := s.verifyMutationActor(ctx, actorID); err != nil {
+		return err
+	}
 	if newOwnerID == "STORE" {
-		if err := s.EnsureStoreUser(ctx); err != nil {
+		if err := s.ensureStoreUser(ctx); err != nil {
 			return err
 		}
 	}
@@ -616,11 +982,14 @@ func (s *SmartContract) TransferAsset(
 
 // ReturnAssetToStore transfers a customer asset back into store inventory.
 func (s *SmartContract) ReturnAssetToStore(ctx contractapi.TransactionContextInterface, id string, actorID string) error {
+	if err := s.verifyMutationActor(ctx, actorID); err != nil {
+		return err
+	}
 	asset, err := s.ReadAsset(ctx, id)
 	if err != nil {
 		return err
 	}
-	if err := s.EnsureStoreUser(ctx); err != nil {
+	if err := s.ensureStoreUser(ctx); err != nil {
 		return err
 	}
 	asset.OwnerID = "STORE"
@@ -643,8 +1012,11 @@ func (s *SmartContract) TransferAssetQuantity(
 	newAssetID string,
 	actorID string,
 ) error {
+	if err := s.verifyMutationActor(ctx, actorID); err != nil {
+		return err
+	}
 	if newOwnerID == "STORE" {
-		if err := s.EnsureStoreUser(ctx); err != nil {
+		if err := s.ensureStoreUser(ctx); err != nil {
 			return err
 		}
 	}
@@ -987,7 +1359,31 @@ func (s *SmartContract) GetAllUsers(
 
 func (s *SmartContract) InitLedger(
 	ctx contractapi.TransactionContextInterface,
+	actorID string,
 ) error {
+	expectedUser := strings.TrimSpace(os.Getenv("IDENTITY_BOOTSTRAP_USER_ID"))
+	expectedMSP := strings.TrimSpace(os.Getenv("IDENTITY_BOOTSTRAP_MSP_ID"))
+	expectedFingerprint := strings.ToLower(strings.TrimSpace(os.Getenv("IDENTITY_BOOTSTRAP_CERT_FINGERPRINT")))
+	if expectedUser == "" || expectedMSP == "" || expectedFingerprint == "" {
+		return fmt.Errorf("ledger initialization is disabled")
+	}
+	if strings.TrimSpace(actorID) != expectedUser {
+		return fmt.Errorf("initialization actor is not allowlisted")
+	}
+	mspID, fingerprint, err := invokerIdentity(ctx)
+	if err != nil {
+		return err
+	}
+	if !strings.EqualFold(mspID, expectedMSP) || !strings.EqualFold(fingerprint, expectedFingerprint) {
+		return fmt.Errorf("invoker Fabric identity is not initialization-allowlisted")
+	}
+	initialized, err := s.UserExists(ctx, expectedUser)
+	if err != nil {
+		return err
+	}
+	if initialized {
+		return fmt.Errorf("ledger is already initialized")
+	}
 
 	users := []User{
 		{

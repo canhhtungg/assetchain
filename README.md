@@ -48,13 +48,19 @@ Admin có thể thay đổi ma trận quyền tại trang **Phân quyền**. Quy
 
 ### Xác thực và bảo mật
 
-- Phiên đăng nhập được ký bởi backend; trình duyệt không nhận thông tin đăng nhập ChainLaunch.
+- Phiên đăng nhập được ký bởi backend và lưu trong cookie `HttpOnly`, `Secure`, `SameSite`; CSRF token riêng chỉ giữ trong `sessionStorage`.
+- TOTP MFA có thể bật theo tài khoản và bắt buộc theo vai trò.
+- Mutating request dùng `Idempotency-Key`; backend lưu kết quả thành công trong SQLite dùng chung giữa các Gunicorn worker.
 - Bắt buộc đổi mật khẩu trong lần đăng nhập đầu tiên hoặc sau khi Admin đặt lại mật khẩu.
 - Mật khẩu đang dùng trong luồng đổi mật khẩu lần đầu chỉ tồn tại trong React state/RAM.
 - Chính sách mật khẩu, rate limit đăng nhập và yêu cầu đặt lại mật khẩu.
 - HTTP security headers, CSP, giới hạn payload và request ID.
 - Audit log JSON có che dữ liệu nhạy cảm, phù hợp truy vấn bằng journald.
 - Systemd credentials cho thông tin đăng nhập ChainLaunch và khóa ký phiên.
+- Mỗi user có ChainLaunch client signing key riêng; mutation fail-closed nếu
+  registry local hoặc binding MSP/certificate trên ledger chưa hợp lệ.
+- Query có thể dùng service identity, nhưng service key không được fallback cho
+  mutation và `actorID` luôn phải khớp certificate invoker.
 
 ## Kiến trúc
 
@@ -237,9 +243,14 @@ Trong ChainLaunch Web UI:
 1. Tạo chaincode tên `assetcc` trên channel `assetchannel` nếu chưa có.
 2. Tạo definition mới với image vừa push.
 3. Dùng version mới và tăng `sequence` so với definition đã commit.
-4. Giữ policy `OR('Org1MSP.peer')` nếu topology vẫn là một organization.
-5. Đặt chaincode address là `127.0.0.1:9999` nếu ChainLaunch và container cùng host như topology tham chiếu.
-6. Chạy lần lượt **Deploy → Install → Approve → Commit**.
+4. Gắn `assetcc/collections_config.json` vào definition để collection `userCredentials` tồn tại trước khi chaincode ghi/đọc credential.
+5. Giữ policy `OR('Org1MSP.peer')` chỉ cho môi trường một organization. Production consortium phải thêm MSP độc lập và dùng policy như `AND('Org1MSP.peer','Org2MSP.peer')` sau khi hai tổ chức đã join channel và approve definition.
+6. Đặt chaincode address là `127.0.0.1:9999` nếu ChainLaunch và container cùng host như topology tham chiếu.
+7. Chạy lần lượt **Deploy → Install → Approve → Commit**.
+
+Sau lần deploy đầu tiên có PDC, gọi `MigrateUserCredential` một lần cho từng username cũ. Hàm này chép hash từ world state sang collection `userCredentials` rồi xóa key `AUTH_*` khỏi trạng thái hiện hành. Sao lưu ledger trước khi migrate và xác minh `GetPasswordHash` vẫn hoạt động. Credential mới và lần đổi mật khẩu tiếp theo chỉ ghi vào PDC.
+
+> Fabric là bất biến: xóa world state **không xóa hash khỏi block/history cũ**. Sau migration phải buộc toàn bộ tài khoản đổi mật khẩu. Nếu yêu cầu bảo mật bắt buộc loại bỏ dữ liệu lịch sử, cần tạo channel/ledger mới và migrate dữ liệu nghiệp vụ đã làm sạch.
 
 Trước bước Commit của một bản nâng cấp, query các hàm đọc trên ledger hiện tại để phát hiện lỗi tương thích dữ liệu cũ. Tối thiểu kiểm tra `GetAllAssets` và `GetAllAssetRecords`. Nếu lỗi, redeploy definition đang hoạt động trước đó rồi sửa bằng một image/version/sequence mới.
 
@@ -250,7 +261,7 @@ Sau khi commit, xác minh trên **mọi peer**:
 - Container image đang running.
 - `GetAllAssets` và `GetAllAssetRecords` trả kết quả.
 
-Production được xác minh gần nhất dùng image `docker.io/canhtung/assetcc:5.4.1`, version `5.4.1`, sequence `8` trên hai peer. Đây là thông tin tham chiếu; hãy đọc trạng thái ChainLaunch hiện tại trước mỗi lần nâng cấp.
+Production được xác minh ngày 2026-10-01 dùng image `docker.io/canhtung/assetcc:6.0.0` (digest `sha256:d2cbe05fc8fa41164a5a61f7fbe1e072926edc1ec7eee5c6d81e20f52022c247`), version `6.0.0`, sequence `9` trên hai peer. Tám tài khoản đăng nhập hiện có đã được bind với tám Fabric client certificate riêng; `STORE` là tài khoản hệ thống không đăng nhập. Đây là thông tin tham chiếu; hãy đọc trạng thái ChainLaunch hiện tại trước mỗi lần nâng cấp.
 
 ## Cài đặt backend
 
@@ -274,7 +285,9 @@ Các biến quan trọng:
 | `FABRIC_USERNAME` | Tài khoản service ChainLaunch; nên cấp qua systemd credential |
 | `FABRIC_PASSWORD` | Mật khẩu ChainLaunch; nên cấp qua systemd credential |
 | `FABRIC_CHAINCODE_ID` | ID chaincode trong ChainLaunch |
-| `FABRIC_KEY_ID` | ID signing key trong ChainLaunch |
+| `FABRIC_KEY_ID` | Service key chỉ dùng query/read; không dùng cho mutation user |
+| `IDENTITY_REGISTRY_DB` | SQLite local mode `0600`: userID → key ID/MSP/certificate fingerprint và hàng đợi yêu cầu cấp identity |
+| `FABRIC_IDENTITY_ORGANIZATION_ID` | Organization ChainLaunch dùng khi Admin duyệt yêu cầu cấp identity; production hiện dùng `1` |
 | `APP_SECRET` | Khóa ngẫu nhiên dùng ký phiên; nên cấp qua systemd credential |
 | `AUTH_TOKEN_MAX_AGE` | Thời hạn phiên, mặc định 8 giờ |
 | `ADMIN_OWNER_ID` | ID Admin/chủ kho mặc định, production dùng `U001` |
@@ -285,6 +298,17 @@ Các biến quan trọng:
 | `DEFAULT_INITIAL_PASSWORD` | Mật khẩu tạm do Admin cấp; người dùng phải đổi ngay |
 | `BACKEND_HOST` | Host bind Flask, mặc định `127.0.0.1` |
 | `MAX_REQUEST_BYTES` | Giới hạn request body, mặc định 64 KiB |
+| `AUTH_COOKIE_*` | Tên/cờ bảo mật cookie phiên; production cross-site dùng `Secure=1`, `SameSite=None` |
+| `AUTH_RETURN_BEARER_TOKEN` | Cờ tương thích frontend cũ; đặt `0` ngay sau khi frontend cookie-session đã phát hành |
+| `SECURITY_STATE_DB` | SQLite dùng chung cho rate limit và idempotency trên một host |
+| `IDEMPOTENCY_TTL` | Thời gian giữ kết quả idempotency, mặc định 24 giờ |
+| `MFA_TOTP_SECRETS_FILE` | JSON username → TOTP Base32 cho development; production ưu tiên systemd credential |
+| `MFA_REQUIRED_ROLES` | Các vai trò bắt buộc MFA sau khi đã cấp secret cho toàn bộ tài khoản |
+
+Ba biến `IDENTITY_BOOTSTRAP_USER_ID`, `IDENTITY_BOOTSTRAP_MSP_ID` và
+`IDENTITY_BOOTSTRAP_CERT_FINGERPRINT` chỉ thuộc runtime external chaincode.
+Chúng để trống theo mặc định và chỉ được đặt giống nhau trên mọi peer trong cửa
+sổ bootstrap Admin một lần; không phải secret nhưng là policy nhạy cảm.
 
 Không đặt secret trong Git, command line, URL hoặc unit file có thể đọc công khai.
 
@@ -313,6 +337,8 @@ chmod 600 ~/.config/assetchain/credentials/APP_SECRET
 ```
 
 `APP_SECRET` phải là giá trị ngẫu nhiên mạnh, ổn định giữa các lần restart. Thay đổi giá trị này sẽ làm mất hiệu lực tất cả phiên đang đăng nhập.
+
+Trên host hỗ trợ `systemd-creds`, ưu tiên tạo credential mã hóa at-rest và dùng mẫu `assetcc/systemd/credentials-encrypted.conf.example`. Không commit file `.cred`; việc tạo/rotate phải thực hiện trực tiếp trên host qua quy trình quản trị bí mật. Có thể đặt toàn bộ JSON TOTP vào credential `MFA_TOTP_SECRETS` để backend đọc từ `$CREDENTIALS_DIRECTORY`.
 
 Service tham chiếu:
 
@@ -446,10 +472,50 @@ Mỗi audit event có timestamp, event, outcome, actor, target, request ID, clie
 - Không ghi mật khẩu/token vào command line, URL, log, issue hoặc tài liệu.
 - Đặt quyền `0700` cho thư mục credential và `0600` cho file secret/state.
 - Sao lưu có kiểm soát thư mục dữ liệu và SQLite database của ChainLaunch sau khi bảo đảm snapshot nhất quán.
-- Sao lưu các file `role-permissions.local.json`, `auth-state.local.json` và credential hash nếu production đang dùng chúng.
+- Sao lưu các file `role-permissions.local.json`, `auth-state.local.json`, `identity-registry.local.sqlite3` và credential hash nếu production đang dùng chúng.
 - Mã hóa bản sao lưu, giới hạn quyền truy cập và diễn tập restore định kỳ.
 - Dùng version image bất biến; ghi nhận digest Docker khi phát hành.
 - Luôn giữ definition đang hoạt động trước đó để rollback khi pre-commit compatibility check thất bại.
+
+
+> **PDC rollout gate:** `USER_CREDENTIAL_PDC_ENABLED` must remain `false` until the committed Fabric definition actually contains `collections_config.json`. The current ChainLaunch definition API commits `Collections: nil`; enabling the flag earlier would break credential reads. Identity migration can be deployed independently, then PDC can be enabled in a later lifecycle upgrade that proves collection bytes on-chain.
+
+### Hardening đã triển khai và phạm vi còn lại
+
+Các kiểm soát có thể chứng minh bằng source/test trong repository:
+
+- Cookie phiên `HttpOnly` thay cho bearer token trong `localStorage`; mọi mutation qua cookie phải có `X-CSRF-Token`.
+- TOTP MFA thuần backend, cửa sổ lệch thời gian ±30 giây; có thể buộc theo vai trò.
+- `Idempotency-Key` cho các hàm chaincode ghi; kết quả thành công được replay thay vì gửi lại giao dịch.
+- Rate limit đăng nhập/reset dùng SQLite khi `SECURITY_STATE_DB` được cấu hình, nên nhiều Gunicorn worker trên cùng host dùng chung trạng thái.
+- Password hash mới nằm trong Fabric PDC `userCredentials`; có hàm migrate dữ liệu `AUTH_*` cũ khỏi world state hiện hành.
+- Hai `network-config.yaml` có private-key marker đã được bỏ khỏi Git index nhưng vẫn được giữ cục bộ nhờ `.gitignore`.
+- Dependency Python khóa version; audit JSON có request ID và redact dữ liệu nhạy cảm.
+- Mutation dùng ChainLaunch client key riêng theo user từ registry local; chaincode đối chiếu `actorID` với MSPID và SHA-256 fingerprint của certificate invoker.
+- Service key chỉ dùng query. User chưa có binding active bị fail-closed; không có fallback/bypass mặc định.
+- Provisioning chỉ nhận/trả metadata công khai, không nhập hoặc xuất private key. Bootstrap Admin là quy trình hai bước, allowlist chính xác và one-time marker trên ledger.
+
+### Threat model của identity layer
+
+- **Backend bị lỗi gán actor:** chaincode vẫn từ chối vì actor binding không khớp certificate ký proposal.
+- **Service/query key bị lạm dụng:** key không có binding user nên mọi business mutation bị từ chối.
+- **User mạo danh user khác:** cả backend kiểm actor với session và chaincode kiểm actor với MSP/certificate.
+- **Registry local bị sửa:** sửa `key_id` đơn lẻ không đủ vì ledger binding vẫn kiểm certificate; tuy vậy attacker kiểm soát cả backend host và ChainLaunch Admin vẫn nằm ngoài trust boundary, nên cần hardening/audit/backup host.
+- **Replay/retry:** idempotency giảm giao dịch lặp từ API; Fabric validation/MVCC vẫn là lớp quyết định ledger.
+- **Provisioning dở dang:** key có thể đã được ChainLaunch tạo nhưng binding ledger thất bại; trạng thái giữ pending/failed và không được dùng mutation, không tự xóa key.
+- **Bootstrap takeover:** bootstrap tắt mặc định, yêu cầu exact Admin ID + MSPID + fingerprint trên mọi peer, chỉ chấp nhận user ledger role Admin và chỉ chạy một lần.
+- **Private-key exposure:** AssetChain chỉ chuyển `key_id`; private key nằm trong trust boundary của ChainLaunch và không được ghi registry/log/API response.
+
+Những phần **không thể được coi là đã khắc phục chỉ bằng commit này**:
+- Network hiện chỉ có `Org1MSP`. Multi-MSP endorsement chỉ có hiệu lực sau khi có tổ chức/peer độc lập, cập nhật channel, approve và commit definition từ mỗi org.
+- Hash cũ vẫn tồn tại trong lịch sử ledger bất biến; migration phải đi kèm reset password toàn bộ, hoặc channel mới nếu phải loại bỏ lịch sử.
+- `network-config.yaml` từng xuất hiện trong Git history; certificate/private key liên quan phải được rotate/revoke và lịch sử remote phải được làm sạch bằng quy trình phối hợp, không chỉ bằng commit xóa file.
+- Contact và dữ liệu tài sản vẫn ở world state; cần thiết kế collection theo consortium/quyền truy cập và kế hoạch migration riêng trước khi chuyển.
+- SQLite giải quyết nhiều worker trên **một host**, không phải HA đa host. Multi-host cần Redis/PostgreSQL dùng chung, load balancer có health check, và state/session strategy đã kiểm thử.
+- SIEM cần collector và đích lưu trữ bên ngoài; repository chỉ phát audit JSON. Cần alert rule, retention, quyền truy cập và diễn tập sự cố.
+- Offsite backup/restore chưa được chứng minh cho đến khi có bản sao mã hóa ngoài host, RPO/RTO, log drill và biên bản restore thực tế.
+- HSM phụ thuộc key provider của Fabric/ChainLaunch và phần cứng/KMS thực tế; không thể chứng minh bằng unit test.
+- Quy trình phê duyệt điều chuyển/bảo trì/thanh lý chuyên biệt cần mô hình nghiệp vụ và phân tách nhiệm vụ được duyệt; hiện mutation vẫn thực hiện trực tiếp theo RBAC.
 
 ## Xử lý sự cố
 

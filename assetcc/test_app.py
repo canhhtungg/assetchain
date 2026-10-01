@@ -15,6 +15,13 @@ class AuthenticationApiTest(unittest.TestCase):
         self.previous_credentials_file = backend.AUTH_CREDENTIALS_FILE
         self.previous_permissions_file = backend.ROLE_PERMISSIONS_FILE
         self.previous_auth_state_file = backend.AUTH_STATE_FILE
+        self.previous_security_state_db = backend.SECURITY_STATE_DB
+        self.previous_identity_registry_db = backend.IDENTITY_REGISTRY_DB
+        self.previous_mfa_file = backend.MFA_TOTP_SECRETS_FILE
+        self.previous_mfa_roles = backend.MFA_REQUIRED_ROLES
+        self.previous_cookie_secure = backend.AUTH_COOKIE_SECURE
+        self.previous_return_bearer = backend.AUTH_RETURN_BEARER_TOKEN
+        self.previous_enforce_identity_login = backend.ENFORCE_FABRIC_IDENTITY_LOGIN
         self.permissions_directory = tempfile.TemporaryDirectory()
         backend.APP_SECRET = "test-only-secret"
         backend.AUTH_CREDENTIALS_FILE = None
@@ -24,6 +31,17 @@ class AuthenticationApiTest(unittest.TestCase):
         backend.AUTH_STATE_FILE = os.path.join(
             self.permissions_directory.name, "auth-state.json"
         )
+        backend.SECURITY_STATE_DB = os.path.join(
+            self.permissions_directory.name, "security-state.sqlite3"
+        )
+        backend.IDENTITY_REGISTRY_DB = os.path.join(
+            self.permissions_directory.name, "identity-registry.sqlite3"
+        )
+        backend.MFA_TOTP_SECRETS_FILE = ""
+        backend.MFA_REQUIRED_ROLES = set()
+        backend.AUTH_COOKIE_SECURE = False
+        backend.AUTH_RETURN_BEARER_TOKEN = False
+        backend.ENFORCE_FABRIC_IDENTITY_LOGIN = False
         backend.login_failures.clear()
         backend.password_reset_attempts.clear()
         backend.app.config.update(TESTING=True)
@@ -34,6 +52,13 @@ class AuthenticationApiTest(unittest.TestCase):
         backend.AUTH_CREDENTIALS_FILE = self.previous_credentials_file
         backend.ROLE_PERMISSIONS_FILE = self.previous_permissions_file
         backend.AUTH_STATE_FILE = self.previous_auth_state_file
+        backend.SECURITY_STATE_DB = self.previous_security_state_db
+        backend.IDENTITY_REGISTRY_DB = self.previous_identity_registry_db
+        backend.MFA_TOTP_SECRETS_FILE = self.previous_mfa_file
+        backend.MFA_REQUIRED_ROLES = self.previous_mfa_roles
+        backend.AUTH_COOKIE_SECURE = self.previous_cookie_secure
+        backend.AUTH_RETURN_BEARER_TOKEN = self.previous_return_bearer
+        backend.ENFORCE_FABRIC_IDENTITY_LOGIN = self.previous_enforce_identity_login
         backend.login_failures.clear()
         backend.password_reset_attempts.clear()
         self.permissions_directory.cleanup()
@@ -178,10 +203,29 @@ class AuthenticationApiTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         payload = response.get_json()["data"]
         self.assertEqual(payload["user"]["username"], "admin")
-        self.assertTrue(payload["token"])
+        self.assertTrue(payload["csrfToken"])
+        self.assertNotIn("token", payload)
+        self.assertIn(f"{backend.AUTH_COOKIE_NAME}=", response.headers["Set-Cookie"])
+        self.assertIn("HttpOnly", response.headers["Set-Cookie"])
         self.assertNotIn("passwordHash", payload["user"])
         self.assertNotIn("password", payload["user"])
         self.assertTrue(payload["user"]["mustChangePassword"])
+
+    @patch("app.invoke_chaincode")
+    def test_login_requires_active_fabric_identity_when_enforced(self, invoke):
+        backend.ENFORCE_FABRIC_IDENTITY_LOGIN = True
+        invoke.side_effect = [
+            {"success": True, "data": {"result": generate_password_hash("correct-password")}},
+            {"success": True, "data": {"result": {
+                "id": "C900", "username": "pending", "role": "CUSTOMER"
+            }}},
+        ]
+        response = self.client.post(
+            "/api/auth/login",
+            json={"username": "pending", "password": "correct-password"},
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.get_json()["code"], "FABRIC_IDENTITY_REQUIRED")
 
     @patch("app.invoke_chaincode")
     def test_login_rejects_wrong_password_without_user_enumeration(self, invoke):
@@ -354,7 +398,8 @@ class AuthenticationApiTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertFalse(backend.password_change_required("C001"))
         self.assertFalse(response.get_json()["data"]["user"]["mustChangePassword"])
-        self.assertTrue(response.get_json()["data"]["token"])
+        self.assertTrue(response.get_json()["data"]["csrfToken"])
+        self.assertNotIn("token", response.get_json()["data"])
 
     def test_required_user_is_blocked_from_other_protected_endpoints(self):
         version = backend.update_password_state("C001", must_change=True)
@@ -368,6 +413,265 @@ class AuthenticationApiTest(unittest.TestCase):
         self.assertEqual(response.status_code, 428)
         self.assertEqual(response.get_json()["code"], "PASSWORD_CHANGE_REQUIRED")
 
+
+    def test_cookie_session_requires_csrf_for_mutation(self):
+        csrf = "test-csrf-token"
+        token = backend.auth_serializer().dumps({
+            "id": "U001", "role": "ADMIN", "version": 0, "csrf": csrf
+        })
+        self.client.set_cookie(backend.AUTH_COOKIE_NAME, token)
+        denied = self.client.put("/api/permissions", json={"permissions": {}})
+        self.assertEqual(denied.status_code, 403)
+        self.assertEqual(denied.get_json()["code"], "CSRF_FAILED")
+
+        accepted = self.client.put(
+            "/api/permissions", json={"permissions": {}},
+            headers={"X-CSRF-Token": csrf},
+        )
+        self.assertEqual(accepted.status_code, 200)
+
+    @patch("app.invoke_chaincode")
+    def test_login_enforces_configured_totp(self, invoke):
+        secret = "JBSWY3DPEHPK3PXP"
+        mfa_path = os.path.join(self.permissions_directory.name, "mfa.json")
+        with open(mfa_path, "w", encoding="utf-8") as output:
+            json.dump({"admin": secret}, output)
+        backend.MFA_TOTP_SECRETS_FILE = mfa_path
+        invoke.side_effect = [
+            {"success": True, "data": {"result": generate_password_hash("correct-password")}},
+            {"success": True, "data": {"result": {
+                "id": "U001", "username": "admin", "role": "ADMIN"
+            }}},
+        ]
+        with patch("app.time", return_value=1_700_000_000):
+            code = backend.totp_code(secret, int(1_700_000_000 // 30))
+            response = self.client.post(
+                "/api/auth/login",
+                json={"username": "admin", "password": "correct-password", "otp": code},
+            )
+        self.assertEqual(response.status_code, 200)
+
+    def test_shared_rate_limit_survives_in_memory_reset(self):
+        key = "127.0.0.1:shared-user"
+        for _ in range(backend.LOGIN_FAILURE_LIMIT):
+            backend.record_login_failure(key)
+        backend.login_failures.clear()
+        self.assertTrue(backend.login_is_rate_limited(key))
+
+    def test_idempotency_cache_replays_successful_mutation(self):
+        scope = ("U001", "/api/assets", "CreateAsset", "request-1", "hash-1")
+        expected = {"success": True, "data": {"tx": "abc"}}
+        backend.idempotency_put(scope, expected)
+        self.assertEqual(backend.idempotency_get(scope), expected)
+        conflict = ("U001", "/api/assets", "CreateAsset", "request-1", "hash-2")
+        self.assertEqual(backend.idempotency_get(conflict)["status_code"], 409)
+
+    @patch("app.fabric_request")
+    def test_mutation_uses_authenticated_users_registered_key(self, fabric_request):
+        backend.save_identity_binding({
+            "user_id": "U001", "key_id": "user-key-91",
+            "organization_id": "12", "msp_id": "Org1MSP",
+            "certificate_fingerprint": "a" * 64,
+            "key_name": "assetchain-U001", "status": "active",
+        })
+        fabric_request.return_value = {"success": True, "data": {"result": {}}}
+        with backend.app.test_request_context("/api/assets", method="POST"):
+            backend.request.auth_user = {"id": "U001", "role": "ADMIN"}
+            result = backend.invoke_chaincode(
+                "CreateAsset",
+                ["A1", "Laptop", "Computer", "STORE", "100", "Active", "", "", "1", "U001"],
+            )
+        self.assertTrue(result["success"])
+        self.assertEqual(fabric_request.call_args.kwargs["json"]["key_id"], "user-key-91")
+
+    @patch("app.fabric_request")
+    def test_mutation_without_identity_fails_closed(self, fabric_request):
+        with backend.app.test_request_context("/api/assets", method="POST"):
+            backend.request.auth_user = {"id": "U404", "role": "CUSTOMER"}
+            result = backend.invoke_chaincode(
+                "DeleteAssetQuantity", ["A1", "1", "U404"]
+            )
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error"], "FABRIC_IDENTITY_REQUIRED")
+        fabric_request.assert_not_called()
+
+    @patch("app.fabric_request")
+    @patch("app.invoke_chaincode")
+    def test_admin_provisions_client_key_without_returning_private_key(self, invoke, fabric_request):
+        backend.save_identity_binding({
+            "user_id": "U001", "key_id": "admin-key-7",
+            "organization_id": "12", "msp_id": "Org1MSP",
+            "certificate_fingerprint": "d" * 64,
+            "key_name": "assetchain-U001", "status": "active",
+        })
+        invoke.side_effect = [
+            {"success": True, "data": {"result": {"id": "C001", "role": "CUSTOMER"}}},
+            {"success": True, "data": {"result": {}}},
+        ]
+        certificate = "-----BEGIN CERTIFICATE-----\nYWJj\n-----END CERTIFICATE-----"
+        fabric_request.side_effect = [
+            {"success": True, "data": {"id": 12, "mspId": "Org1MSP"}},
+            {
+                "success": True,
+                "data": {"id": 91, "certificate": certificate, "privateKey": "must-not-leak"},
+            },
+        ]
+        token = backend.auth_serializer().dumps({"id": "U001", "role": "ADMIN"})
+        response = self.client.post(
+            "/api/admin/fabric-identities/C001",
+            json={
+                "organizationID": "12", "mspID": "Org1MSP",
+                "name": "assetchain-C001", "description": "AssetChain user C001",
+                "dnsNames": ["client.example"], "ipAddresses": ["127.0.0.1"],
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(response.status_code, 201)
+        payload = response.get_json()["data"]
+        self.assertEqual(payload["keyID"], "91")
+        self.assertEqual(payload["status"], "active")
+        self.assertNotIn("private", json.dumps(response.get_json()).lower())
+        self.assertEqual(fabric_request.call_args_list[0].args, (
+            "GET", "organizations/12"
+        ))
+        self.assertEqual(fabric_request.call_args_list[1].args, (
+            "POST", "organizations/12/keys"
+        ))
+        self.assertEqual(fabric_request.call_args_list[1].kwargs["json"], {
+            "name": "assetchain-C001", "role": "client",
+            "description": "AssetChain user C001",
+            "dnsNames": ["client.example"], "ipAddresses": ["127.0.0.1"],
+        })
+        invoke.assert_any_call(
+            "RegisterUserIdentity",
+            ["C001", "Org1MSP", backend.certificate_fingerprint(certificate), "U001"],
+        )
+        self.assertEqual(backend.identity_binding("C001")["key_id"], "91")
+
+    @patch("app.fabric_request")
+    @patch("app.invoke_chaincode")
+    def test_identity_provision_rejects_msp_not_owned_by_organization(self, invoke, fabric_request):
+        backend.save_identity_binding({
+            "user_id": "U001", "key_id": "admin-key-7",
+            "organization_id": "12", "msp_id": "Org1MSP",
+            "certificate_fingerprint": "d" * 64,
+            "key_name": "assetchain-U001", "status": "active",
+        })
+        invoke.return_value = {
+            "success": True, "data": {"result": {"id": "C001", "role": "CUSTOMER"}}
+        }
+        fabric_request.return_value = {
+            "success": True, "data": {"id": 12, "mspId": "Org1MSP"}
+        }
+        token = backend.auth_serializer().dumps({"id": "U001", "role": "ADMIN"})
+        response = self.client.post(
+            "/api/admin/fabric-identities/C001",
+            json={"organizationID": "12", "mspID": "OtherMSP"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("không khớp", response.get_json()["message"])
+        fabric_request.assert_called_once_with("GET", "organizations/12")
+        self.assertIsNone(backend.identity_binding("C001", include_inactive=True))
+
+    @patch("app.provision_fabric_identity")
+    def test_admin_approves_identity_request_and_activates_binding(self, provision):
+        request_item = backend.add_fabric_identity_request({
+            "id": "C009", "username": "customer9",
+            "fullName": "Customer Nine", "role": "CUSTOMER",
+        }, "S001")
+        provision.return_value = ({
+            "userID": "C009", "keyID": "customer-key-9",
+            "organizationID": "1", "mspID": "Org1MSP",
+            "certificateFingerprint": "a" * 64, "status": "active",
+        }, None, 201)
+        token = backend.auth_serializer().dumps({"id": "U001", "role": "ADMIN"})
+        response = self.client.post(
+            f"/api/fabric-identity-requests/{request_item['id']}/approve",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["data"]["status"], "approved")
+        provision.assert_called_once_with(
+            "C009",
+            {
+                "organizationID": "1",
+                "name": "assetchain-C009-v1",
+                "description": "AssetChain per-user signing identity for C009",
+            },
+            bootstrap=False,
+        )
+
+    def test_identity_request_with_orphan_key_never_creates_duplicate(self):
+        request_item = backend.add_fabric_identity_request({
+            "id": "C010", "username": "customer10",
+            "fullName": "Customer Ten", "role": "CUSTOMER",
+        }, "S001")
+        backend.update_fabric_identity_request(
+            request_item["id"], "failed", "U001",
+            key_id="orphan-key-10", error="certificate missing",
+        )
+        token = backend.auth_serializer().dumps({"id": "U001", "role": "ADMIN"})
+        with patch("app.provision_fabric_identity") as provision:
+            response = self.client.post(
+                f"/api/fabric-identity-requests/{request_item['id']}/approve",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("không tự động tạo thêm key", response.get_json()["message"])
+        provision.assert_not_called()
+
+    @patch("app.invoke_chaincode")
+    def test_admin_completes_pending_bootstrap_with_pending_key(self, invoke):
+        backend.save_identity_binding({
+            "user_id": "U001", "key_id": "admin-key-7",
+            "organization_id": "12", "msp_id": "Org1MSP",
+            "certificate_fingerprint": "c" * 64,
+            "key_name": "assetchain-U001", "status": "pending",
+        })
+        invoke.return_value = {"success": True, "data": {"result": {}}}
+        token = backend.auth_serializer().dumps({"id": "U001", "role": "ADMIN"})
+        response = self.client.post(
+            "/api/admin/fabric-identities/U001/bootstrap/complete",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(response.status_code, 200)
+        invoke.assert_called_once_with(
+            "BootstrapAdminIdentity", ["U001"],
+            signing_key_id="admin-key-7", allow_unbound=True,
+        )
+        self.assertEqual(backend.identity_binding("U001")["status"], "active")
+
+    @patch("app.invoke_chaincode")
+    def test_admin_reconciles_completed_ledger_binding_without_duplicate_register(self, invoke):
+        backend.save_identity_binding({
+            "user_id": "U001", "key_id": "admin-key-7",
+            "organization_id": "12", "msp_id": "Org1MSP",
+            "certificate_fingerprint": "d" * 64,
+            "key_name": "assetchain-U001", "status": "active",
+        })
+        backend.save_identity_binding({
+            "user_id": "C001", "key_id": "customer-key-8",
+            "organization_id": "12", "msp_id": "Org1MSP",
+            "certificate_fingerprint": "e" * 64,
+            "key_name": "assetchain-C001", "status": "failed",
+        })
+        invoke.return_value = {
+            "success": True,
+            "data": {"result": {
+                "userID": "C001", "mspID": "Org1MSP",
+                "certificateFingerprint": "e" * 64,
+            }},
+        }
+        token = backend.auth_serializer().dumps({"id": "U001", "role": "ADMIN"})
+        response = self.client.post(
+            "/api/admin/fabric-identities/C001/complete",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(response.status_code, 200)
+        invoke.assert_called_once_with("GetUserIdentity", ["C001"])
+        self.assertEqual(backend.identity_binding("C001")["status"], "active")
+
     def test_chaincode_proxy_requires_a_session(self):
         response = self.client.post(
             "/api/chaincode/invoke",
@@ -377,6 +681,12 @@ class AuthenticationApiTest(unittest.TestCase):
 
     @patch("app.invoke_chaincode")
     def test_admin_can_delete_another_user(self, invoke):
+        backend.save_identity_binding({
+            "user_id": "U002", "key_id": "user-key-2",
+            "organization_id": "12", "msp_id": "Org1MSP",
+            "certificate_fingerprint": "f" * 64,
+            "key_name": "assetchain-U002", "status": "active",
+        })
         token = backend.auth_serializer().dumps(dict(id="U001", role="ADMIN"))
         invoke.return_value = {"success": True, "data": {"status": "success"}}
         response = self.client.delete(
@@ -384,7 +694,9 @@ class AuthenticationApiTest(unittest.TestCase):
             headers={"Authorization": f"Bearer {token}"},
         )
         self.assertEqual(response.status_code, 200)
-        invoke.assert_called_once_with("DeleteUser", ["U002"])
+        invoke.assert_called_once_with("DeleteUser", ["U002", "U001"])
+        binding = backend.identity_binding("U002", include_inactive=True)
+        self.assertEqual(binding["status"], "revoked")
 
     @patch("app.invoke_chaincode")
     def test_admin_cannot_delete_current_account(self, invoke):
@@ -528,6 +840,12 @@ class AuthenticationApiTest(unittest.TestCase):
         self.assertEqual(create_args[0], "user_4")
         self.assertEqual(create_args[5], "user_4")
         self.assertEqual(create_args[6], "U001")
+        identity_request = response.get_json()["identityRequest"]
+        self.assertEqual(identity_request["user_id"], "user_4")
+        self.assertEqual(identity_request["status"], "pending")
+        queued = backend.list_fabric_identity_requests()
+        self.assertEqual(len(queued), 1)
+        self.assertEqual(queued[0]["userID"], "user_4")
 
     @patch("app.invoke_chaincode")
     def test_sales_create_customer_response_hides_private_fields(self, invoke):
@@ -580,7 +898,7 @@ class AuthenticationApiTest(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 200)
         invoke.assert_called_with(
-            "UpdateUser", ["C001", "Customer", "CUSTOMER", "new@example.com"]
+            "UpdateUser", ["C001", "Customer", "CUSTOMER", "new@example.com", "C001"]
         )
 
     def test_sales_can_view_created_customer_without_private_fields(self):

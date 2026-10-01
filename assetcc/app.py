@@ -2,13 +2,19 @@ import os
 import json
 import logging
 import requests
+import base64
+import hashlib
+import hmac
+import sqlite3
+import ssl
+import struct
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
 from secrets import token_urlsafe
 from threading import Lock
-from time import monotonic
+from time import monotonic, time
 
 from flask import Flask, g, has_request_context, request, jsonify
 from flask_cors import CORS
@@ -118,7 +124,11 @@ ALLOWED_ORIGINS = [
     ).split(",")
     if origin.strip()
 ]
-CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGINS}})
+CORS(
+    app,
+    resources={r"/api/*": {"origins": ALLOWED_ORIGINS}},
+    supports_credentials=True,
+)
 
 SECURITY_HEADERS = {
     "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'; base-uri 'none'",
@@ -157,6 +167,23 @@ FABRIC_PASSWORD = runtime_secret("FABRIC_PASSWORD")
 
 APP_SECRET = runtime_secret("APP_SECRET")
 AUTH_TOKEN_MAX_AGE = int(os.getenv("AUTH_TOKEN_MAX_AGE", "28800"))
+AUTH_RETURN_BEARER_TOKEN = os.getenv("AUTH_RETURN_BEARER_TOKEN", "0") == "1"
+AUTH_COOKIE_NAME = os.getenv("AUTH_COOKIE_NAME", "assetchain_session")
+AUTH_COOKIE_SECURE = os.getenv("AUTH_COOKIE_SECURE", "1") != "0"
+AUTH_COOKIE_SAMESITE = os.getenv("AUTH_COOKIE_SAMESITE", "None")
+SECURITY_STATE_DB = os.getenv("SECURITY_STATE_DB", "").strip()
+IDENTITY_REGISTRY_DB = os.getenv("IDENTITY_REGISTRY_DB", "").strip()
+ENFORCE_FABRIC_IDENTITY_LOGIN = os.getenv("ENFORCE_FABRIC_IDENTITY_LOGIN", "0") == "1"
+FABRIC_IDENTITY_ORGANIZATION_ID = os.getenv(
+    "FABRIC_IDENTITY_ORGANIZATION_ID", "1"
+).strip()
+IDEMPOTENCY_TTL = int(os.getenv("IDEMPOTENCY_TTL", "86400"))
+MFA_TOTP_SECRETS_FILE = os.getenv("MFA_TOTP_SECRETS_FILE", "").strip()
+MFA_REQUIRED_ROLES = {
+    role.strip().lower()
+    for role in os.getenv("MFA_REQUIRED_ROLES", "").split(",")
+    if role.strip()
+}
 AUTH_CREDENTIALS_FILE = os.getenv("AUTH_CREDENTIALS_FILE")
 ROLE_PERMISSIONS_FILE = os.getenv("ROLE_PERMISSIONS_FILE") or str(
     Path(__file__).with_name("role-permissions.local.json")
@@ -208,6 +235,26 @@ FABRIC_KEY_ID = os.getenv(
     "FABRIC_KEY_ID",
     "6"
 )
+
+# Actor position for every public chaincode mutation. Queries deliberately use
+# the service identity; mutations must resolve a per-user key from the registry.
+MUTATION_ACTOR_ARGUMENT_INDEX = {
+    "CreateAsset": 9,
+    "CreateUser": 6,
+    "DeleteAsset": 1,
+    "DeleteUser": 1,
+    "SetUserPassword": 2,
+    "MigrateUserCredential": 1,
+    "TransferAsset": 2,
+    "TransferAssetQuantity": 4,
+    "UpdateAsset": 9,
+    "UpdateUser": 4,
+    "ReturnAssetToStore": 1,
+    "DeleteAssetQuantity": 2,
+    "EnsureStoreUser": 0,
+    "RegisterUserIdentity": 3,
+    "RotateUserIdentity": 3,
+}
 
 
 # ==========================================
@@ -319,13 +366,285 @@ def fabric_request(method, endpoint, **kwargs):
 
 
 # ==========================================
-# CHAINCODE INVOKE
+# FABRIC IDENTITY REGISTRY + CHAINCODE INVOKE
 # ==========================================
 
-def invoke_chaincode(function, args=None):
+def identity_registry_connection():
+    """Open the local public-metadata registry; private keys never enter it."""
+    if not IDENTITY_REGISTRY_DB:
+        return None
+    path = Path(IDENTITY_REGISTRY_DB)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(path, timeout=10)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("PRAGMA busy_timeout=10000")
+    connection.executescript("""
+        CREATE TABLE IF NOT EXISTS fabric_identity_bindings (
+            user_id TEXT PRIMARY KEY,
+            key_id TEXT NOT NULL UNIQUE,
+            organization_id TEXT NOT NULL,
+            msp_id TEXT NOT NULL,
+            certificate_fingerprint TEXT NOT NULL,
+            key_name TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN ('pending', 'active', 'failed', 'revoked')),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_error TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS fabric_identity_requests (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            username TEXT NOT NULL DEFAULT '',
+            full_name TEXT NOT NULL DEFAULT '',
+            role TEXT NOT NULL DEFAULT '',
+            requested_by TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL CHECK(status IN (
+                'pending', 'processing', 'approved', 'rejected', 'failed'
+            )),
+            requested_at TEXT NOT NULL,
+            reviewed_at TEXT NOT NULL DEFAULT '',
+            reviewed_by TEXT NOT NULL DEFAULT '',
+            key_id TEXT NOT NULL DEFAULT '',
+            last_error TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_fabric_identity_requests_status
+            ON fabric_identity_requests(status, requested_at);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_fabric_identity_requests_actionable
+            ON fabric_identity_requests(user_id)
+            WHERE status IN ('pending', 'processing', 'failed');
+    """)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        connection.close()
+        raise
+    return connection
+
+
+def identity_binding(user_id, include_inactive=False):
+    connection = identity_registry_connection()
+    if connection is None:
+        return None
+    query = "SELECT * FROM fabric_identity_bindings WHERE user_id = ?"
+    parameters = [str(user_id)]
+    if not include_inactive:
+        query += " AND status = 'active'"
+    row = connection.execute(query, parameters).fetchone()
+    connection.close()
+    return dict(row) if row else None
+
+
+def add_fabric_identity_request(user, requested_by):
+    """Queue one durable, de-duplicated provisioning request for a ledger user."""
+    user_id = str(user.get("id", "")).strip()
+    if not user_id or normalize_role(user.get("role")) == "store":
+        return None
+    if identity_binding(user_id) is not None:
+        return None
+    connection = identity_registry_connection()
+    if connection is None:
+        raise RuntimeError("IDENTITY_REGISTRY_DB chưa được cấu hình")
+    existing = connection.execute(
+        """SELECT * FROM fabric_identity_requests
+           WHERE user_id = ? AND status IN ('pending', 'processing', 'failed')
+           ORDER BY requested_at DESC LIMIT 1""",
+        (user_id,),
+    ).fetchone()
+    if existing:
+        connection.close()
+        return dict(existing)
+    now = datetime.now(timezone.utc).isoformat()
+    item = {
+        "id": token_urlsafe(12),
+        "user_id": user_id,
+        "username": str(user.get("username", "")),
+        "full_name": str(user.get("fullName", "")),
+        "role": normalize_role(user.get("role")).upper(),
+        "requested_by": str(requested_by or ""),
+        "status": "pending",
+        "requested_at": now,
+    }
+    with connection:
+        connection.execute(
+            """INSERT INTO fabric_identity_requests
+               (id, user_id, username, full_name, role, requested_by,
+                status, requested_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            tuple(item[key] for key in (
+                "id", "user_id", "username", "full_name", "role",
+                "requested_by", "status", "requested_at",
+            )),
+        )
+    connection.close()
+    return item
+
+
+def list_fabric_identity_requests():
+    connection = identity_registry_connection()
+    if connection is None:
+        return None
+    rows = connection.execute(
+        """SELECT id, user_id AS userID, username, full_name AS fullName,
+                  role, requested_by AS requestedBy, status,
+                  requested_at AS requestedAt, reviewed_at AS reviewedAt,
+                  reviewed_by AS reviewedBy, key_id AS keyID,
+                  last_error AS lastError
+           FROM fabric_identity_requests
+           ORDER BY requested_at DESC"""
+    ).fetchall()
+    connection.close()
+    return [dict(row) for row in rows]
+
+
+def fabric_identity_request(request_id):
+    connection = identity_registry_connection()
+    if connection is None:
+        return None
+    row = connection.execute(
+        "SELECT * FROM fabric_identity_requests WHERE id = ?", (str(request_id),)
+    ).fetchone()
+    connection.close()
+    return dict(row) if row else None
+
+
+def claim_fabric_identity_request(request_id, reviewer_id):
+    """Atomically claim a request so two Admins cannot create duplicate keys."""
+    connection = identity_registry_connection()
+    if connection is None:
+        return None
+    now = datetime.now(timezone.utc).isoformat()
+    with connection:
+        cursor = connection.execute(
+            """UPDATE fabric_identity_requests
+               SET status = 'processing', reviewed_at = ?, reviewed_by = ?,
+                   last_error = ''
+               WHERE id = ? AND status IN ('pending', 'failed')""",
+            (now, str(reviewer_id or ""), str(request_id)),
+        )
+    selected = connection.execute(
+        "SELECT * FROM fabric_identity_requests WHERE id = ?", (str(request_id),)
+    ).fetchone()
+    connection.close()
+    if cursor.rowcount != 1:
+        return None
+    return dict(selected)
+
+
+def update_fabric_identity_request(request_id, status, reviewer_id, *, key_id="", error=""):
+    connection = identity_registry_connection()
+    if connection is None:
+        return None
+    now = datetime.now(timezone.utc).isoformat()
+    with connection:
+        connection.execute(
+            """UPDATE fabric_identity_requests
+               SET status = ?, reviewed_at = ?, reviewed_by = ?,
+                   key_id = CASE WHEN ? != '' THEN ? ELSE key_id END,
+                   last_error = ?
+               WHERE id = ?""",
+            (
+                str(status), now, str(reviewer_id or ""), str(key_id or ""),
+                str(key_id or ""), str(error or "")[:512], str(request_id),
+            ),
+        )
+    connection.close()
+    return next(
+        (item for item in (list_fabric_identity_requests() or [])
+         if item.get("id") == str(request_id)),
+        None,
+    )
+
+
+def save_identity_binding(binding):
+    connection = identity_registry_connection()
+    if connection is None:
+        raise RuntimeError("IDENTITY_REGISTRY_DB chưa được cấu hình")
+    now = datetime.now(timezone.utc).isoformat()
+    with connection:
+        connection.execute(
+            """INSERT INTO fabric_identity_bindings
+               (user_id, key_id, organization_id, msp_id,
+                certificate_fingerprint, key_name, status, created_at,
+                updated_at, last_error)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(user_id) DO UPDATE SET
+                 key_id=excluded.key_id,
+                 organization_id=excluded.organization_id,
+                 msp_id=excluded.msp_id,
+                 certificate_fingerprint=excluded.certificate_fingerprint,
+                 key_name=excluded.key_name,
+                 status=excluded.status,
+                 updated_at=excluded.updated_at,
+                 last_error=excluded.last_error""",
+            (
+                str(binding["user_id"]), str(binding["key_id"]),
+                str(binding["organization_id"]), str(binding["msp_id"]),
+                str(binding["certificate_fingerprint"]).lower(),
+                str(binding["key_name"]), str(binding["status"]),
+                str(binding.get("created_at") or now), now,
+                str(binding.get("last_error") or "")[:512],
+            ),
+        )
+    connection.close()
+
+
+def mark_identity_binding(user_id, status, error=""):
+    connection = identity_registry_connection()
+    if connection is None:
+        raise RuntimeError("IDENTITY_REGISTRY_DB chưa được cấu hình")
+    with connection:
+        connection.execute(
+            """UPDATE fabric_identity_bindings
+               SET status = ?, updated_at = ?, last_error = ?
+               WHERE user_id = ?""",
+            (status, datetime.now(timezone.utc).isoformat(), str(error)[:512], str(user_id)),
+        )
+    connection.close()
+
+
+def mutation_actor_id(function, args):
+    index = MUTATION_ACTOR_ARGUMENT_INDEX.get(function)
+    if index is None:
+        return None
+    if index >= len(args):
+        return ""
+    return str(args[index]).strip()
+
+
+def invoke_chaincode(function, args=None, *, signing_key_id=None, allow_unbound=False):
 
     if args is None:
         args = []
+
+    actor_id = mutation_actor_id(function, args)
+    if function in MUTATING_CHAINCODE_FUNCTIONS or function in MUTATION_ACTOR_ARGUMENT_INDEX:
+        authenticated_id = ""
+        if has_request_context():
+            authenticated_id = str(getattr(request, "auth_user", {}).get("id", "")).strip()
+        if not actor_id:
+            return {"success": False, "status_code": 403, "error": "Mutation thiếu actorID"}
+        if authenticated_id and not hmac.compare_digest(authenticated_id, actor_id):
+            return {"success": False, "status_code": 403, "error": "actorID không khớp phiên đăng nhập"}
+        if signing_key_id is None:
+            binding = identity_binding(actor_id)
+            if binding is None:
+                return {
+                    "success": False,
+                    "status_code": 409,
+                    "error": "FABRIC_IDENTITY_REQUIRED",
+                    "details": f"User {actor_id} chưa có Fabric identity đang hoạt động",
+                }
+            signing_key_id = binding["key_id"]
+        elif not allow_unbound:
+            binding = identity_binding(actor_id)
+            if binding is None or not hmac.compare_digest(str(binding["key_id"]), str(signing_key_id)):
+                return {"success": False, "status_code": 403, "error": "Signing key không thuộc actor"}
+
+    scope = idempotency_scope(function, args)
+    cached = idempotency_get(scope)
+    if cached is not None:
+        return cached
 
     endpoint = (
         f"sc/fabric/chaincodes/"
@@ -333,16 +652,18 @@ def invoke_chaincode(function, args=None):
     )
 
     payload = {
-        "key_id": str(FABRIC_KEY_ID),
+        "key_id": str(signing_key_id or FABRIC_KEY_ID),
         "function": function,
         "args": args
     }
 
-    return fabric_request(
+    result = fabric_request(
         "POST",
         endpoint,
         json=payload
     )
+    idempotency_put(scope, result)
+    return result
 
 
 # ==========================================
@@ -374,6 +695,359 @@ def parse_chaincode_result(result):
         return None
 
 
+def response_object(value):
+    """Unwrap known ChainLaunch envelopes without recursively selecting nested IDs."""
+    current = value
+    for _ in range(4):
+        if not isinstance(current, dict):
+            return {}
+        unwrapped = None
+        for name in ("data", "result"):
+            candidate = current.get(name)
+            if isinstance(candidate, dict):
+                unwrapped = candidate
+                break
+        if unwrapped is None:
+            return current
+        current = unwrapped
+    return current if isinstance(current, dict) else {}
+
+
+def certificate_fingerprint(pem_certificate):
+    normalized = str(pem_certificate or "").strip()
+    if "BEGIN CERTIFICATE" not in normalized:
+        raise ValueError("ChainLaunch response không chứa certificate PEM")
+    der = ssl.PEM_cert_to_DER_cert(normalized)
+    return hashlib.sha256(der).hexdigest()
+
+
+def provision_fabric_identity(user_id, body, bootstrap=False):
+    organization_id = str(body.get("organizationID", "")).strip()
+    requested_msp_id = str(body.get("mspID", "")).strip()
+    key_name = str(body.get("name", f"assetchain-{user_id}")).strip()
+    if not organization_id or not key_name:
+        return None, "organizationID và name là bắt buộc", 400
+    registry = identity_registry_connection()
+    if registry is None:
+        return None, "IDENTITY_REGISTRY_DB chưa được cấu hình", 503
+    registry.close()
+    if identity_binding(user_id, include_inactive=True):
+        return None, "User đã có binding; dùng quy trình rotate có kiểm soát", 409
+
+    actor_id = str(request.auth_user.get("id", ""))
+    if not bootstrap and identity_binding(actor_id) is None:
+        return None, "Admin chưa có Fabric identity active; chưa tạo key mới", 409
+
+    user_result = invoke_chaincode("GetUser", [str(user_id)])
+    user = parse_chaincode_result(user_result)
+    if not user_result.get("success") or not isinstance(user, dict):
+        return None, "User không tồn tại trên ledger", 404
+    if bootstrap and (
+        str(request.auth_user.get("id", "")) != str(user_id)
+        or normalize_role(user.get("role")) != "admin"
+    ):
+        return None, "Bootstrap chỉ dành cho chính tài khoản Admin đầu tiên", 403
+
+    organization_result = fabric_request(
+        "GET", f"organizations/{organization_id}"
+    )
+    organization = response_object(organization_result.get("data"))
+    msp_id = str(organization.get("mspId") or organization.get("mspID") or "").strip()
+    if not organization_result.get("success") or not msp_id:
+        return None, "Không thể xác minh MSP của organization trong ChainLaunch", 502
+    if requested_msp_id and not hmac.compare_digest(requested_msp_id, msp_id):
+        return None, "mspID không khớp organization trong ChainLaunch", 400
+
+    payload = {"name": key_name, "role": "client"}
+    for request_name, chainlaunch_name in (
+        ("description", "description"),
+        ("dnsNames", "dnsNames"),
+        ("ipAddresses", "ipAddresses"),
+    ):
+        if body.get(request_name) not in (None, "", []):
+            payload[chainlaunch_name] = body[request_name]
+
+    created = fabric_request(
+        "POST", f"organizations/{organization_id}/keys", json=payload
+    )
+    if not created.get("success"):
+        return None, "ChainLaunch không thể tạo client signing key", 502
+    response_data = response_object(created.get("data"))
+    key_id = response_data.get("id") or response_data.get("keyId") or response_data.get("key_id")
+    certificate = (
+        response_data.get("certificate")
+        or response_data.get("certificatePem")
+        or response_data.get("certificate_pem")
+        or response_data.get("cert")
+    )
+    if key_id in (None, ""):
+        return None, "ChainLaunch đã trả response không có key ID; cần đối soát thủ công", 502
+    try:
+        fingerprint = certificate_fingerprint(certificate)
+    except (TypeError, ValueError):
+        # The key may now exist in ChainLaunch. Never delete it automatically and
+        # never fabricate a fingerprint: an operator must reconcile it explicitly.
+        audit_event(
+            "fabric_identity.provision", "incomplete",
+            request.auth_user.get("id"), request.auth_user.get("role"), user_id,
+            {"reason": "certificate_missing", "keyID": str(key_id)},
+        )
+        return {
+            "userID": str(user_id), "keyID": str(key_id), "status": "unbound"
+        }, "Key đã tạo nhưng response thiếu certificate; chưa binding, không được dùng mutation", 502
+
+    binding = {
+        "user_id": str(user_id), "key_id": str(key_id),
+        "organization_id": organization_id, "msp_id": msp_id,
+        "certificate_fingerprint": fingerprint, "key_name": key_name,
+        "status": "pending", "last_error": "",
+    }
+    try:
+        save_identity_binding(binding)
+    except (OSError, sqlite3.Error, RuntimeError) as error:
+        return {
+            "userID": str(user_id), "keyID": str(key_id), "status": "unbound"
+        }, f"Key đã tạo nhưng registry local lỗi: {error}", 500
+
+    if bootstrap:
+        # Two-step by design: the operator must first learn the certificate
+        # fingerprint, configure the chaincode allowlist identically on every
+        # peer, and only then call the completion endpoint.
+        return {
+            "userID": str(user_id), "keyID": str(key_id),
+            "organizationID": organization_id, "mspID": msp_id,
+            "certificateFingerprint": fingerprint, "status": "pending",
+        }, None, 202
+    else:
+        ledger_result = invoke_chaincode(
+            "RegisterUserIdentity",
+            [str(user_id), msp_id, fingerprint, actor_id],
+        )
+    if not ledger_result.get("success"):
+        error = ledger_result.get("error") or "ledger binding thất bại"
+        mark_identity_binding(user_id, "failed", error)
+        return {
+            "userID": str(user_id), "keyID": str(key_id), "mspID": msp_id,
+            "certificateFingerprint": fingerprint, "status": "failed",
+        }, "Key đã tạo nhưng chưa bind ledger; không được dùng mutation", 409
+
+    mark_identity_binding(user_id, "active")
+    result = {
+        "userID": str(user_id), "keyID": str(key_id),
+        "organizationID": organization_id, "mspID": msp_id,
+        "certificateFingerprint": fingerprint, "status": "active",
+    }
+    audit_event(
+        "fabric_identity.bootstrap" if bootstrap else "fabric_identity.provision",
+        "success", actor_id, request.auth_user.get("role"), user_id,
+        {"keyID": str(key_id), "mspID": msp_id},
+    )
+    return result, None, 201
+
+
+
+MUTATING_CHAINCODE_FUNCTIONS = {
+    "CreateAsset", "CreateUser", "DeleteAsset", "DeleteUser",
+    "SetUserPassword", "MigrateUserCredential", "TransferAsset", "TransferAssetQuantity",
+    "UpdateAsset", "UpdateUser", "ReturnAssetToStore", "DeleteAssetQuantity",
+    "EnsureStoreUser", "RegisterUserIdentity", "RotateUserIdentity",
+}
+
+
+def security_db_connection():
+    if not SECURITY_STATE_DB:
+        return None
+    path = Path(SECURITY_STATE_DB)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(path, timeout=10)
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("PRAGMA busy_timeout=10000")
+    connection.executescript("""
+        CREATE TABLE IF NOT EXISTS rate_limit_events (
+            bucket TEXT NOT NULL,
+            event_at REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_rate_limit_bucket_time
+            ON rate_limit_events(bucket, event_at);
+        CREATE TABLE IF NOT EXISTS idempotency_results (
+            actor_id TEXT NOT NULL,
+            request_path TEXT NOT NULL,
+            function_name TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL,
+            request_hash TEXT NOT NULL,
+            response_json TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            PRIMARY KEY(actor_id, request_path, function_name, idempotency_key)
+        );
+    """)
+    return connection
+
+
+def shared_rate_limit_count(bucket, window):
+    connection = security_db_connection()
+    if connection is None:
+        return None
+    cutoff = time() - window
+    with connection:
+        connection.execute(
+            "DELETE FROM rate_limit_events WHERE event_at < ?", (cutoff,)
+        )
+        row = connection.execute(
+            "SELECT COUNT(*) FROM rate_limit_events WHERE bucket = ? AND event_at >= ?",
+            (bucket, cutoff),
+        ).fetchone()
+    connection.close()
+    return int(row[0])
+
+
+def shared_rate_limit_add(bucket):
+    connection = security_db_connection()
+    if connection is None:
+        return False
+    with connection:
+        connection.execute(
+            "INSERT INTO rate_limit_events(bucket, event_at) VALUES (?, ?)",
+            (bucket, time()),
+        )
+    connection.close()
+    return True
+
+
+def shared_rate_limit_clear(bucket):
+    connection = security_db_connection()
+    if connection is None:
+        return False
+    with connection:
+        connection.execute("DELETE FROM rate_limit_events WHERE bucket = ?", (bucket,))
+    connection.close()
+    return True
+
+
+def idempotency_scope(function, args):
+    if not has_request_context() or request.method not in {"POST", "PUT", "PATCH", "DELETE"}:
+        return None
+    if function not in MUTATING_CHAINCODE_FUNCTIONS:
+        return None
+    key = request.headers.get("Idempotency-Key", "").strip()
+    if not key:
+        return None
+    if len(key) > 128 or not all(character.isalnum() or character in "-_.:" for character in key):
+        return None
+    actor_id = str(getattr(request, "auth_user", {}).get("id", "anonymous"))
+    serialized = json.dumps(
+        {"function": function, "args": args}, ensure_ascii=False,
+        sort_keys=True, separators=(",", ":"),
+    )
+    return actor_id, request.path, function, key, hashlib.sha256(serialized.encode()).hexdigest()
+
+
+def idempotency_get(scope):
+    if scope is None:
+        return None
+    connection = security_db_connection()
+    if connection is None:
+        return None
+    actor_id, path, function, key, request_hash = scope
+    cutoff = time() - IDEMPOTENCY_TTL
+    with connection:
+        connection.execute("DELETE FROM idempotency_results WHERE created_at < ?", (cutoff,))
+        row = connection.execute(
+            """SELECT request_hash, response_json FROM idempotency_results
+               WHERE actor_id = ? AND request_path = ? AND function_name = ?
+                 AND idempotency_key = ?""",
+            (actor_id, path, function, key),
+        ).fetchone()
+    connection.close()
+    if row is None:
+        return None
+    if not hmac.compare_digest(row[0], request_hash):
+        return {
+            "success": False,
+            "error": "Idempotency-Key đã được dùng cho nội dung khác",
+            "status_code": 409,
+        }
+    return json.loads(row[1])
+
+
+def idempotency_put(scope, result):
+    if scope is None or not result.get("success"):
+        return
+    connection = security_db_connection()
+    if connection is None:
+        return
+    actor_id, path, function, key, request_hash = scope
+    with connection:
+        connection.execute(
+            """INSERT OR IGNORE INTO idempotency_results
+               (actor_id, request_path, function_name, idempotency_key,
+                request_hash, response_json, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (actor_id, path, function, key, request_hash,
+             json.dumps(result, ensure_ascii=False, separators=(",", ":")), time()),
+        )
+    connection.close()
+
+
+def load_mfa_secrets():
+    serialized = runtime_secret("MFA_TOTP_SECRETS")
+    try:
+        if serialized:
+            configured = json.loads(serialized)
+        elif MFA_TOTP_SECRETS_FILE:
+            configured = json.loads(
+                Path(MFA_TOTP_SECRETS_FILE).read_text(encoding="utf-8")
+            )
+        else:
+            return {}
+    except (OSError, ValueError):
+        return {}
+    return {
+        str(username).strip().lower(): str(secret).replace(" ", "").upper()
+        for username, secret in configured.items()
+        if str(username).strip() and str(secret).strip()
+    } if isinstance(configured, dict) else {}
+
+
+def totp_code(secret, counter, digits=6):
+    padded = secret + "=" * ((8 - len(secret) % 8) % 8)
+    key = base64.b32decode(padded, casefold=True)
+    digest = hmac.new(key, struct.pack(">Q", counter), hashlib.sha1).digest()
+    offset = digest[-1] & 0x0F
+    value = struct.unpack(">I", digest[offset:offset + 4])[0] & 0x7FFFFFFF
+    return str(value % (10 ** digits)).zfill(digits)
+
+
+def valid_totp(secret, candidate, timestamp=None):
+    candidate = str(candidate or "").strip()
+    if len(candidate) != 6 or not candidate.isdigit():
+        return False
+    counter = int((time() if timestamp is None else timestamp) // 30)
+    try:
+        return any(
+            hmac.compare_digest(totp_code(secret, counter + drift), candidate)
+            for drift in (-1, 0, 1)
+        )
+    except (ValueError, TypeError):
+        return False
+
+
+def set_auth_cookie(response, token):
+    response.set_cookie(
+        AUTH_COOKIE_NAME, token, max_age=AUTH_TOKEN_MAX_AGE,
+        secure=AUTH_COOKIE_SECURE, httponly=True,
+        samesite=AUTH_COOKIE_SAMESITE, path="/api",
+    )
+    return response
+
+
+def clear_auth_cookie(response):
+    response.delete_cookie(
+        AUTH_COOKIE_NAME, secure=AUTH_COOKIE_SECURE,
+        httponly=True, samesite=AUTH_COOKIE_SAMESITE, path="/api",
+    )
+    return response
+
+
 def auth_serializer():
     if not APP_SECRET:
         raise RuntimeError("APP_SECRET chưa được cấu hình")
@@ -385,6 +1059,9 @@ def login_attempt_key(username):
 
 
 def login_is_rate_limited(key):
+    shared_count = shared_rate_limit_count("login:" + key, LOGIN_FAILURE_WINDOW)
+    if shared_count is not None:
+        return shared_count >= LOGIN_FAILURE_LIMIT
     now = monotonic()
     cutoff = now - LOGIN_FAILURE_WINDOW
     with login_failures_lock:
@@ -395,6 +1072,8 @@ def login_is_rate_limited(key):
 
 
 def record_login_failure(key):
+    if shared_rate_limit_add("login:" + key):
+        return
     with login_failures_lock:
         if len(login_failures) > 5000:
             login_failures.clear()
@@ -402,11 +1081,20 @@ def record_login_failure(key):
 
 
 def clear_login_failures(key):
+    if shared_rate_limit_clear("login:" + key):
+        return
     with login_failures_lock:
         login_failures.pop(key, None)
 
 
 def record_password_reset_attempt(key):
+    bucket = "password-reset:" + key
+    shared_count = shared_rate_limit_count(bucket, PASSWORD_RESET_REQUEST_WINDOW)
+    if shared_count is not None:
+        if shared_count >= PASSWORD_RESET_REQUEST_LIMIT:
+            return False
+        shared_rate_limit_add(bucket)
+        return True
     now = monotonic()
     cutoff = now - PASSWORD_RESET_REQUEST_WINDOW
     with password_reset_attempts_lock:
@@ -675,7 +1363,8 @@ def set_user_password_to_default(user_id):
         return None, "Không thể đặt mật khẩu cho tài khoản hệ thống"
     reset_result = invoke_chaincode(
         "SetUserPassword",
-        [str(user_id), generate_password_hash(DEFAULT_INITIAL_PASSWORD)],
+        [str(user_id), generate_password_hash(DEFAULT_INITIAL_PASSWORD),
+         str(request.auth_user.get("id", ""))],
     )
     if not reset_result.get("success"):
         return None, "Không thể đặt lại mật khẩu trên Blockchain"
@@ -863,12 +1552,14 @@ def require_auth(admin_only=False, permission=None, allow_password_change=False)
         @wraps(handler)
         def wrapped(*args, **kwargs):
             header = request.headers.get("Authorization", "")
-            if not header.startswith("Bearer "):
+            cookie_token = request.cookies.get(AUTH_COOKIE_NAME, "")
+            token = cookie_token or (header[7:] if header.startswith("Bearer ") else "")
+            if not token:
                 audit_event("authorization.denied", "denied", details={"reason": "missing_token"})
                 return jsonify({"status": "error", "message": "Chưa đăng nhập"}), 401
             try:
                 identity = auth_serializer().loads(
-                    header[7:], max_age=AUTH_TOKEN_MAX_AGE
+                    token, max_age=AUTH_TOKEN_MAX_AGE
                 )
             except (BadSignature, SignatureExpired, RuntimeError):
                 audit_event("authorization.denied", "denied", details={"reason": "invalid_or_expired_token"})
@@ -877,6 +1568,19 @@ def require_auth(admin_only=False, permission=None, allow_password_change=False)
                     "message": "Phiên đăng nhập không hợp lệ hoặc đã hết hạn"
                 }), 401
             user_id = str(identity.get("id", ""))
+            if cookie_token and request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+                csrf_token = request.headers.get("X-CSRF-Token", "")
+                if not csrf_token or not hmac.compare_digest(
+                    str(identity.get("csrf", "")), csrf_token
+                ):
+                    audit_event(
+                        "authorization.denied", "denied", user_id, identity.get("role"),
+                        details={"reason": "csrf_check_failed"},
+                    )
+                    return jsonify({
+                        "status": "error", "code": "CSRF_FAILED",
+                        "message": "Yêu cầu thiếu mã chống CSRF hợp lệ"
+                    }), 403
             try:
                 token_version = int(identity.get("version", 0))
             except (TypeError, ValueError):
@@ -978,17 +1682,50 @@ def login():
             "message": "Username hoặc password không đúng"
         }), 401
 
+    user_role = normalize_role(user.get("role"))
+    mfa_secret = load_mfa_secrets().get(username.lower())
+    if user_role in MFA_REQUIRED_ROLES and not mfa_secret:
+        audit_event(
+            "authentication.login", "error", target_id=user.get("id"),
+            details={"reason": "required_mfa_not_configured"},
+        )
+        return jsonify({
+            "status": "error",
+            "message": "Tài khoản bắt buộc MFA nhưng chưa được cấp TOTP secret"
+        }), 503
+    if mfa_secret and not valid_totp(mfa_secret, body.get("otp")):
+        record_login_failure(attempt_key)
+        audit_event(
+            "authentication.login", "failure", target_id=user.get("id"),
+            details={"username": username.lower(), "reason": "invalid_mfa"},
+        )
+        return jsonify({
+            "status": "error", "code": "MFA_REQUIRED",
+            "message": "Mã xác thực MFA không hợp lệ"
+        }), 401
+
     clear_login_failures(attempt_key)
-    user["role"] = normalize_role(user.get("role")).upper()
+    user["role"] = user_role.upper()
     user_id = str(user.get("id", ""))
+    if ENFORCE_FABRIC_IDENTITY_LOGIN and identity_binding(user_id) is None:
+        audit_event(
+            "authentication.login", "denied", target_id=user_id,
+            details={"reason": "fabric_identity_required"},
+        )
+        return jsonify({
+            "status": "error", "code": "FABRIC_IDENTITY_REQUIRED",
+            "message": "Tài khoản chưa được cấp Fabric identity đang hoạt động"
+        }), 403
     must_change_password = register_first_login(user_id)
     user["mustChangePassword"] = must_change_password
 
     try:
+        csrf_token = token_urlsafe(24)
         token = auth_serializer().dumps({
             "id": user_id,
             "role": user.get("role"),
             "version": session_version(user_id),
+            "csrf": csrf_token,
         })
     except RuntimeError as error:
         audit_event(
@@ -1002,10 +1739,24 @@ def login():
         details={"mustChangePassword": must_change_password},
     )
 
-    return jsonify({
+    response_data = {"user": user, "csrfToken": csrf_token}
+    if AUTH_RETURN_BEARER_TOKEN:
+        response_data["token"] = token
+    response = jsonify({
         "status": "success",
-        "data": {"user": user, "token": token}
+        "data": response_data
     })
+    return set_auth_cookie(response, token)
+
+
+@app.route("/api/auth/logout", methods=["POST"])
+@require_auth(allow_password_change=True)
+def logout():
+    audit_event(
+        "authentication.logout", "success",
+        request.auth_user.get("id"), request.auth_user.get("role"),
+    )
+    return clear_auth_cookie(jsonify({"status": "success"}))
 
 
 @app.route("/api/auth/password-reset-requests", methods=["POST"])
@@ -1099,7 +1850,7 @@ def change_password():
         }), 401
 
     updated = invoke_chaincode(
-        "SetUserPassword", [user_id, generate_password_hash(new_password)]
+        "SetUserPassword", [user_id, generate_password_hash(new_password), user_id]
     )
     if not updated.get("success"):
         return jsonify({
@@ -1109,21 +1860,27 @@ def change_password():
         }), 500
 
     version = update_password_state(user_id, must_change=False)
+    csrf_token = token_urlsafe(24)
     token = auth_serializer().dumps({
         "id": user_id,
         "role": request.auth_user.get("role"),
         "version": version,
+        "csrf": csrf_token,
     })
     user["role"] = normalize_role(user.get("role")).upper()
     user["mustChangePassword"] = False
     audit_event(
         "password.change", "success", user_id, user.get("role"), target_id=user_id,
     )
-    return jsonify({
+    response_data = {"user": user, "csrfToken": csrf_token}
+    if AUTH_RETURN_BEARER_TOKEN:
+        response_data["token"] = token
+    response = jsonify({
         "status": "success",
         "message": "Đổi mật khẩu thành công",
-        "data": {"user": user, "token": token},
+        "data": response_data,
     })
+    return set_auth_cookie(response, token)
 
 
 @app.route("/api/password-reset-requests", methods=["GET"])
@@ -1233,6 +1990,251 @@ def my_permissions():
     })
 
 
+@app.route("/api/fabric-identity-requests", methods=["GET"])
+@require_auth(admin_only=True)
+def get_fabric_identity_requests():
+    items = list_fabric_identity_requests()
+    if items is None:
+        return jsonify({
+            "status": "error", "message": "IDENTITY_REGISTRY_DB chưa được cấu hình"
+        }), 503
+    return jsonify({"status": "success", "data": items})
+
+
+@app.route("/api/fabric-identity-requests/<request_id>/<decision>", methods=["POST"])
+@require_auth(admin_only=True)
+def review_fabric_identity_request(request_id, decision):
+    if decision not in {"approve", "reject"}:
+        return jsonify({"status": "error", "message": "Quyết định không hợp lệ"}), 400
+    selected = fabric_identity_request(request_id)
+    if selected is None:
+        return jsonify({"status": "error", "message": "Yêu cầu không tồn tại"}), 404
+    reviewer_id = str(request.auth_user.get("id", ""))
+    claimed = claim_fabric_identity_request(request_id, reviewer_id)
+    if claimed is None:
+        return jsonify({
+            "status": "error", "message": "Yêu cầu này đang được xử lý hoặc đã hoàn tất"
+        }), 409
+
+    user_id = str(claimed["user_id"])
+    if decision == "reject":
+        updated = update_fabric_identity_request(
+            request_id, "rejected", reviewer_id
+        )
+        audit_event(
+            "fabric_identity.request_review", "rejected", reviewer_id,
+            request.auth_user.get("role"), user_id, {"requestID": request_id},
+        )
+        return jsonify({
+            "status": "success", "message": "Đã từ chối yêu cầu cấp Fabric identity",
+            "data": updated,
+        })
+
+    binding = identity_binding(user_id, include_inactive=True)
+    if binding is None and str(claimed.get("key_id", "")):
+        message = (
+            "Yêu cầu đã ghi nhận key nhưng chưa có binding; cần đối soát "
+            "ChainLaunch, không tự động tạo thêm key"
+        )
+        updated = update_fabric_identity_request(
+            request_id, "failed", reviewer_id,
+            key_id=claimed.get("key_id", ""), error=message,
+        )
+        return jsonify({"status": "error", "message": message, "data": updated}), 409
+
+    if binding is not None:
+        result, error, response_status = complete_fabric_identity_binding(
+            user_id, reviewer_id
+        )
+    else:
+        safe_user_id = "".join(
+            character if character.isalnum() or character in "_.-" else "-"
+            for character in user_id
+        )[:64]
+        result, error, response_status = provision_fabric_identity(
+            user_id,
+            {
+                "organizationID": FABRIC_IDENTITY_ORGANIZATION_ID,
+                "name": f"assetchain-{safe_user_id}-v1",
+                "description": f"AssetChain per-user signing identity for {user_id}",
+            },
+            bootstrap=False,
+        )
+
+    key_id = str((result or {}).get("keyID", ""))
+    if error:
+        updated = update_fabric_identity_request(
+            request_id, "failed", reviewer_id, key_id=key_id, error=error
+        )
+        audit_event(
+            "fabric_identity.request_review", "failed", reviewer_id,
+            request.auth_user.get("role"), user_id,
+            {"requestID": request_id, "keyID": key_id, "reason": error},
+        )
+        return jsonify({
+            "status": "error", "message": error, "data": updated,
+        }), response_status
+
+    updated = update_fabric_identity_request(
+        request_id, "approved", reviewer_id, key_id=key_id
+    )
+    audit_event(
+        "fabric_identity.request_review", "approved", reviewer_id,
+        request.auth_user.get("role"), user_id,
+        {"requestID": request_id, "keyID": key_id},
+    )
+    return jsonify({
+        "status": "success",
+        "message": "Đã tự động cấp và kích hoạt Fabric identity",
+        "data": updated,
+        "identity": result,
+    })
+
+
+@app.route("/api/admin/fabric-identities", methods=["GET"])
+@require_auth(admin_only=True)
+def list_fabric_identities():
+    connection = identity_registry_connection()
+    if connection is None:
+        return jsonify({
+            "status": "error", "message": "IDENTITY_REGISTRY_DB chưa được cấu hình"
+        }), 503
+    rows = connection.execute(
+        """SELECT user_id, key_id, organization_id, msp_id,
+                  certificate_fingerprint, key_name, status, created_at, updated_at
+           FROM fabric_identity_bindings ORDER BY user_id"""
+    ).fetchall()
+    connection.close()
+    return jsonify({"status": "success", "data": [dict(row) for row in rows]})
+
+
+@app.route("/api/admin/fabric-identities/<user_id>", methods=["POST"])
+@require_auth(admin_only=True)
+def create_fabric_identity(user_id):
+    result, error, status = provision_fabric_identity(
+        user_id, request.get_json(silent=True) or {}, bootstrap=False
+    )
+    if error:
+        return jsonify({"status": "error", "message": error, "data": result}), status
+    return jsonify({"status": "success", "data": result}), status
+
+
+def complete_fabric_identity_binding(user_id, actor_id):
+    binding = identity_binding(user_id, include_inactive=True)
+    if not binding:
+        return None, "Không có user binding đang chờ", 409
+    if binding.get("status") == "active":
+        return {
+            "userID": str(user_id), "keyID": str(binding["key_id"]),
+            "mspID": binding["msp_id"],
+            "certificateFingerprint": binding["certificate_fingerprint"],
+            "status": "active",
+        }, None, 200
+    if binding.get("status") not in {"pending", "failed"}:
+        return None, "Binding không ở trạng thái có thể hoàn tất", 409
+    if identity_binding(actor_id) is None:
+        return None, "Admin chưa có Fabric identity active", 409
+
+    # Reconcile a response-loss case before submitting another ledger mutation.
+    current_result = invoke_chaincode("GetUserIdentity", [str(user_id)])
+    current = parse_chaincode_result(current_result)
+    already_bound = (
+        current_result.get("success") and isinstance(current, dict)
+        and hmac.compare_digest(str(current.get("mspID", "")), str(binding["msp_id"]))
+        and hmac.compare_digest(
+            str(current.get("certificateFingerprint", "")).lower(),
+            str(binding["certificate_fingerprint"]).lower(),
+        )
+    )
+    if not already_bound:
+        ledger_result = invoke_chaincode(
+            "RegisterUserIdentity",
+            [
+                str(user_id), binding["msp_id"],
+                binding["certificate_fingerprint"], str(actor_id),
+            ],
+        )
+        if not ledger_result.get("success"):
+            error = ledger_result.get("error") or "ledger binding thất bại"
+            mark_identity_binding(user_id, "failed", error)
+            return {
+                "userID": str(user_id), "keyID": str(binding["key_id"]),
+                "status": "failed",
+            }, "Binding ledger vẫn thất bại", 409
+    mark_identity_binding(user_id, "active")
+    return {
+        "userID": str(user_id), "keyID": str(binding["key_id"]),
+        "mspID": binding["msp_id"],
+        "certificateFingerprint": binding["certificate_fingerprint"],
+        "status": "active",
+    }, None, 200
+
+
+@app.route("/api/admin/fabric-identities/<user_id>/complete", methods=["POST"])
+@require_auth(admin_only=True)
+def complete_fabric_identity(user_id):
+    result, error, status = complete_fabric_identity_binding(
+        user_id, str(request.auth_user.get("id", ""))
+    )
+    if error:
+        return jsonify({"status": "error", "message": error, "data": result}), status
+    return jsonify({"status": "success", "data": result}), status
+
+
+@app.route("/api/admin/fabric-identities/<user_id>/bootstrap", methods=["POST"])
+@require_auth(admin_only=True)
+def bootstrap_fabric_identity(user_id):
+    result, error, status = provision_fabric_identity(
+        user_id, request.get_json(silent=True) or {}, bootstrap=True
+    )
+    if error:
+        return jsonify({"status": "error", "message": error, "data": result}), status
+    return jsonify({"status": "success", "data": result}), status
+
+
+@app.route("/api/admin/fabric-identities/<user_id>/bootstrap/complete", methods=["POST"])
+@require_auth(admin_only=True)
+def complete_fabric_identity_bootstrap(user_id):
+    actor_id = str(request.auth_user.get("id", ""))
+    if actor_id != str(user_id):
+        return jsonify({
+            "status": "error",
+            "message": "Bootstrap chỉ dành cho chính tài khoản Admin đầu tiên",
+        }), 403
+    binding = identity_binding(user_id, include_inactive=True)
+    if not binding or binding.get("status") not in {"pending", "failed"}:
+        return jsonify({
+            "status": "error", "message": "Không có bootstrap binding đang chờ"
+        }), 409
+    ledger_result = invoke_chaincode(
+        "BootstrapAdminIdentity", [str(user_id)],
+        signing_key_id=str(binding["key_id"]), allow_unbound=True,
+    )
+    if not ledger_result.get("success"):
+        error = ledger_result.get("error") or "ledger bootstrap thất bại"
+        mark_identity_binding(user_id, "failed", error)
+        return jsonify({
+            "status": "error",
+            "message": "Bootstrap ledger thất bại; binding vẫn fail-closed",
+            "data": {"userID": str(user_id), "status": "failed"},
+        }), 409
+    mark_identity_binding(user_id, "active")
+    audit_event(
+        "fabric_identity.bootstrap", "success", actor_id,
+        request.auth_user.get("role"), user_id,
+        {"keyID": str(binding["key_id"]), "mspID": binding["msp_id"]},
+    )
+    return jsonify({
+        "status": "success",
+        "data": {
+            "userID": str(user_id), "keyID": str(binding["key_id"]),
+            "mspID": binding["msp_id"],
+            "certificateFingerprint": binding["certificate_fingerprint"],
+            "status": "active",
+        },
+    })
+
+
 @app.route("/api/chaincode/invoke", methods=["POST"])
 @require_auth()
 def authenticated_chaincode_invoke():
@@ -1242,9 +2244,10 @@ def authenticated_chaincode_invoke():
     blocked_functions = {
         "CreateAsset", "CreateUser", "DeleteAsset", "DeleteUser",
         "EnsureStoreUser", "GetAllAssets", "GetAllUsers", "GetAssetHistory",
-        "GetPasswordHash", "SetUserPassword", "TransferAsset",
+        "GetPasswordHash", "SetUserPassword", "MigrateUserCredential", "TransferAsset",
         "TransferAssetQuantity", "UpdateAsset", "UpdateUser", "UsernameExists",
-        "ReturnAssetToStore", "DeleteAssetQuantity"
+        "ReturnAssetToStore", "DeleteAssetQuantity", "RegisterUserIdentity",
+        "RotateUserIdentity", "BootstrapAdminIdentity", "GetUserIdentity"
     }
     if not function or not isinstance(args, list):
         return jsonify({
@@ -1877,10 +2880,26 @@ def create_user():
         "createdBy": str(request.auth_user.get("id", "")),
     }
     update_password_state(user_id, must_change=True)
+    identity_request = None
+    identity_request_error = ""
+    try:
+        identity_request = add_fabric_identity_request(
+            created_user, request.auth_user.get("id")
+        )
+    except (OSError, sqlite3.Error, RuntimeError) as error:
+        identity_request_error = str(error)
+        audit_event(
+            "fabric_identity.request_create", "failed",
+            request.auth_user.get("id"), request.auth_user.get("role"), user_id,
+            {"reason": identity_request_error},
+        )
     audit_event(
         "user.create", "success",
         request.auth_user.get("id"), request.auth_user.get("role"), user_id,
-        {"targetRole": requested_role},
+        {
+            "targetRole": requested_role,
+            "identityRequestID": (identity_request or {}).get("id", ""),
+        },
     )
     response_user = public_user_for_identity(request.auth_user, created_user)
     if creator_role == "sales":
@@ -1889,12 +2908,20 @@ def create_user():
             "fullName": str(body["fullName"]),
             "role": "CUSTOMER",
         }
-    return jsonify({
+    response = {
         "status": "success",
-        "message": "Tạo người dùng thành công với mật khẩu mặc định",
+        "message": (
+            "Tạo người dùng thành công; yêu cầu cấp Fabric identity đã gửi tới Admin"
+            if identity_request else
+            "Tạo người dùng thành công nhưng chưa thể gửi yêu cầu cấp Fabric identity"
+        ),
         "data": response_user or created_user,
-        "fabric_response": result["data"]
-    })
+        "identityRequest": identity_request,
+        "fabric_response": result["data"],
+    }
+    if identity_request_error:
+        response["warning"] = identity_request_error
+    return jsonify(response)
 
 
 @app.route("/api/users/<user_id>", methods=["PUT"])
@@ -1956,7 +2983,8 @@ def update_user(user_id):
 
     updated = invoke_chaincode(
         "UpdateUser",
-        [str(user_id), full_name, role.upper(), contact]
+        [str(user_id), full_name, role.upper(), contact,
+         str(request.auth_user.get("id", ""))]
     )
     if not updated.get("success"):
         return jsonify({"status": "error", "message": "Không thể cập nhật người dùng", "fabric_response": updated}), 500
@@ -1978,7 +3006,9 @@ def delete_user(user_id):
             "message": "Admin không thể tự xóa tài khoản đang đăng nhập"
         }), 400
 
-    result = invoke_chaincode("DeleteUser", [str(user_id)])
+    result = invoke_chaincode(
+        "DeleteUser", [str(user_id), str(request.auth_user.get("id", ""))]
+    )
     if not result.get("success"):
         return jsonify({
             "status": "error",
@@ -1986,6 +3016,8 @@ def delete_user(user_id):
             "fabric_response": result
         }), 409
 
+    if identity_binding(user_id, include_inactive=True):
+        mark_identity_binding(user_id, "revoked", "ledger user deleted")
     audit_event(
         "user.delete", "success", request.auth_user.get("id"),
         request.auth_user.get("role"), user_id,

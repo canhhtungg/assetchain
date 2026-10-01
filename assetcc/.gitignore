@@ -6,3 +6,10 @@ __pycache__/
 credentials*.json
 role-permissions*.json
 auth-state*.json
+security-state*.sqlite3
+security-state*.sqlite3-shm
+security-state*.sqlite3-wal
+identity-registry*.sqlite3
+identity-registry*.sqlite3-shm
+identity-registry*.sqlite3-wal
+mfa*.json

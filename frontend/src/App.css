@@ -253,7 +253,8 @@ tbody tr:hover td { background: rgba(255,255,255,.025); }
 .type-badge { background: rgba(109,106,255,.1); color: #aaa8ff; }
 .status.active, .request-status.approved { background: rgba(119,230,165,.1); color: var(--success); }
 .status.pending, .request-status.pending { background: rgba(255,174,76,.1); color: var(--orange); }
-.status.inactive, .request-status.rejected { background: rgba(255,107,120,.1); color: #ff9da6; }
+.request-status.processing { background: rgba(109,106,255,.12); color: #aaa8ff; }
+.status.inactive, .request-status.rejected, .request-status.failed { background: rgba(255,107,120,.1); color: #ff9da6; }
 .empty { padding: 42px !important; color: var(--subtle) !important; text-align: center; }
 .transaction-detail { min-width: 280px; line-height: 1.6; }
 
