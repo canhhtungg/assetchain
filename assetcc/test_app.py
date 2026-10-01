@@ -1027,6 +1027,197 @@ class AuthenticationApiTest(unittest.TestCase):
         self.assertEqual(response.status_code, 403)
         self.assertEqual(invoke.call_count, 1)
 
+    def test_workflow_mutations_have_actor_indexes_and_classification(self):
+        expected = {
+            "SubmitAssetCreationRequest": 10,
+            "SubmitInventoryTransferRequest": 5,
+            "ApproveWorkflowRequest": 2,
+            "RejectWorkflowRequest": 2,
+            "AcceptWorkflowRequest": 2,
+            "DeclineWorkflowRequest": 2,
+        }
+        for function, index in expected.items():
+            self.assertEqual(backend.MUTATION_ACTOR_ARGUMENT_INDEX[function], index)
+            self.assertIn(function, backend.MUTATING_CHAINCODE_FUNCTIONS)
+
+    @patch("app.invoke_chaincode")
+    def test_warehouse_asset_route_submits_request_without_direct_creation(self, invoke):
+        invoke.return_value = {
+            "success": True,
+            "data": {"result": {
+                "id": "WF-CRE-stable", "type": "ASSET_CREATION",
+                "status": "PENDING_APPROVAL", "assetID": "SKU-W1",
+            }},
+        }
+        token = backend.auth_serializer().dumps({"id": "W001", "role": "WAREHOUSE"})
+        response = self.client.post(
+            "/api/assets",
+            json={
+                "id": "SKU-W1", "name": "Phone", "type": "Electronics",
+                "value": 1000, "quantity": 5, "status": "Active",
+            },
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Idempotency-Key": "warehouse-create-1",
+            },
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertIn("sau khi được duyệt", response.get_json()["message"])
+        function, args = invoke.call_args.args
+        self.assertEqual(function, "SubmitAssetCreationRequest")
+        self.assertEqual(args[1], "SKU-W1")
+        self.assertEqual(args[-1], "W001")
+        self.assertNotIn("CreateAsset", [call.args[0] for call in invoke.call_args_list])
+        self.assertNotIn("password", json.dumps(args).lower())
+
+    @patch("app.invoke_chaincode")
+    def test_workflow_request_id_is_stable_for_idempotency_key(self, invoke):
+        invoke.return_value = {
+            "success": True,
+            "data": {"result": {"status": "PENDING_APPROVAL"}},
+        }
+        token = backend.auth_serializer().dumps({"id": "W001", "role": "WAREHOUSE"})
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Idempotency-Key": "same-create-key",
+        }
+        body = {
+            "id": "SKU-STABLE", "name": "Phone", "type": "Electronics",
+            "value": 1000, "quantity": 1, "status": "Active",
+        }
+        first = self.client.post("/api/workflow/asset-creation-requests", json=body, headers=headers)
+        second = self.client.post("/api/workflow/asset-creation-requests", json=body, headers=headers)
+        self.assertEqual(first.status_code, 201)
+        self.assertEqual(second.status_code, 201)
+        self.assertEqual(invoke.call_args_list[0].args[1][0], invoke.call_args_list[1].args[1][0])
+
+    @patch("app.invoke_chaincode")
+    def test_sales_transfer_route_reserves_via_workflow_without_direct_transfer(self, invoke):
+        invoke.side_effect = [
+            {"success": True, "data": {"result": {
+                "id": "SKU-S1", "ownerID": "STORE", "quantity": 5,
+                "reservedQuantity": 0,
+            }}},
+            {"success": True, "data": {"result": {
+                "id": "C001", "role": "CUSTOMER",
+            }}},
+            {"success": True, "data": {"result": {
+                "id": "WF-TRA-1", "type": "INVENTORY_TRANSFER",
+                "status": "PENDING_APPROVAL", "assetID": "SKU-S1",
+                "targetCustomerID": "C001", "quantity": 2,
+            }}},
+        ]
+        token = backend.auth_serializer().dumps({"id": "S001", "role": "SALES"})
+        response = self.client.post(
+            "/api/assets/SKU-S1/transfer",
+            json={"newOwnerID": "C001", "quantity": 2, "newAssetID": "SALE-S1"},
+            headers={"Authorization": f"Bearer {token}", "Idempotency-Key": "sale-1"},
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertIn("giữ chỗ", response.get_json()["message"])
+        functions = [call.args[0] for call in invoke.call_args_list]
+        self.assertEqual(functions, ["ReadAsset", "GetUser", "SubmitInventoryTransferRequest"])
+        self.assertNotIn("TransferAsset", functions)
+        self.assertNotIn("TransferAssetQuantity", functions)
+
+    @patch("app.invoke_chaincode")
+    def test_workflow_request_list_has_strict_role_filtering(self, invoke):
+        items = [
+            {"id": "C1", "makerID": "W001", "type": "ASSET_CREATION", "status": "PENDING_APPROVAL"},
+            {"id": "T1", "makerID": "S001", "targetCustomerID": "C001", "type": "INVENTORY_TRANSFER", "status": "AWAITING_CUSTOMER"},
+            {"id": "T2", "makerID": "S002", "targetCustomerID": "C002", "type": "INVENTORY_TRANSFER", "status": "COMPLETED"},
+        ]
+        invoke.return_value = {"success": True, "data": {"result": items}}
+        cases = [
+            ({"id": "U001", "role": "ADMIN"}, ["C1", "T1", "T2"]),
+            ({"id": "M001", "role": "MANAGER"}, ["C1", "T1", "T2"]),
+            ({"id": "W001", "role": "WAREHOUSE"}, ["C1"]),
+            ({"id": "S001", "role": "SALES"}, ["T1"]),
+            ({"id": "C001", "role": "CUSTOMER"}, ["T1"]),
+        ]
+        for identity, expected_ids in cases:
+            with self.subTest(role=identity["role"]):
+                token = backend.auth_serializer().dumps(identity)
+                response = self.client.get(
+                    "/api/workflow/requests",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(
+                    [item["id"] for item in response.get_json()["data"]],
+                    expected_ids,
+                )
+
+    @patch("app.invoke_chaincode")
+    def test_workflow_decisions_enforce_route_roles_and_actor(self, invoke):
+        invoke.return_value = {
+            "success": True,
+            "data": {"result": {"id": "T1", "status": "AWAITING_CUSTOMER"}},
+        }
+        sales_token = backend.auth_serializer().dumps({"id": "S001", "role": "SALES"})
+        denied = self.client.post(
+            "/api/workflow/requests/T1/approve",
+            headers={"Authorization": f"Bearer {sales_token}"},
+        )
+        self.assertEqual(denied.status_code, 403)
+        invoke.assert_not_called()
+
+        manager_token = backend.auth_serializer().dumps({"id": "M001", "role": "MANAGER"})
+        approved = self.client.post(
+            "/api/workflow/requests/T1/approve",
+            json={"reason": "verified"},
+            headers={"Authorization": f"Bearer {manager_token}"},
+        )
+        self.assertEqual(approved.status_code, 200)
+        invoke.assert_called_once_with(
+            "ApproveWorkflowRequest", ["T1", "verified", "M001"]
+        )
+
+        invoke.reset_mock()
+        customer_token = backend.auth_serializer().dumps({"id": "C001", "role": "CUSTOMER"})
+        accepted = self.client.post(
+            "/api/workflow/requests/T1/accept",
+            headers={"Authorization": f"Bearer {customer_token}"},
+        )
+        self.assertEqual(accepted.status_code, 200)
+        invoke.assert_called_once_with(
+            "AcceptWorkflowRequest", ["T1", "", "C001"]
+        )
+
+    @patch("app.invoke_chaincode")
+    def test_manager_pending_count_excludes_customer_only_stage(self, invoke):
+        invoke.return_value = {"success": True, "data": {"result": [
+            {"id": "C1", "status": "PENDING_APPROVAL"},
+            {"id": "T1", "status": "AWAITING_CUSTOMER"},
+            {"id": "T2", "status": "COMPLETED"},
+        ]}}
+        token = backend.auth_serializer().dumps({"id": "M001", "role": "MANAGER"})
+        response = self.client.get(
+            "/api/workflow/pending-counts",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["data"], {
+            "pendingApproval": 1, "awaitingCustomer": 1, "total": 1,
+        })
+
+    @patch("app.invoke_chaincode")
+    def test_customer_pending_count_only_includes_target_requests(self, invoke):
+        invoke.return_value = {"success": True, "data": {"result": [
+            {"id": "T1", "targetCustomerID": "C001", "status": "AWAITING_CUSTOMER"},
+            {"id": "T2", "targetCustomerID": "C002", "status": "AWAITING_CUSTOMER"},
+            {"id": "T3", "targetCustomerID": "C001", "status": "COMPLETED"},
+        ]}}
+        token = backend.auth_serializer().dumps({"id": "C001", "role": "CUSTOMER"})
+        response = self.client.get(
+            "/api/workflow/pending-counts",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["data"], {
+            "pendingApproval": 0, "awaitingCustomer": 1, "total": 1,
+        })
+
 
 if __name__ == "__main__":
     unittest.main()

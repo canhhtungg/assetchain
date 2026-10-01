@@ -17,6 +17,18 @@ type SmartContract struct {
 
 const credentialCollection = "userCredentials"
 
+const (
+	workflowRequestPrefix   = "WORKFLOW_REQUEST_"
+	workflowAssetLockPrefix = "WORKFLOW_ASSET_LOCK_"
+	requestTypeCreation     = "ASSET_CREATION"
+	requestTypeTransfer     = "INVENTORY_TRANSFER"
+	statusPendingApproval   = "PENDING_APPROVAL"
+	statusAwaitingCustomer  = "AWAITING_CUSTOMER"
+	statusCompleted         = "COMPLETED"
+	statusRejected          = "REJECTED"
+	statusDeclined          = "DECLINED"
+)
+
 func credentialPrivateDataEnabled() bool {
 	return strings.EqualFold(strings.TrimSpace(os.Getenv("USER_CREDENTIAL_PDC_ENABLED")), "true")
 }
@@ -135,6 +147,30 @@ func (s *SmartContract) verifyMutationActor(ctx contractapi.TransactionContextIn
 	return nil
 }
 
+func canonicalRole(role string) string {
+	normalized := strings.ToLower(strings.TrimSpace(role))
+	if normalized == "user" {
+		return "customer"
+	}
+	return normalized
+}
+
+func (s *SmartContract) actorWithRoles(ctx contractapi.TransactionContextInterface, actorID string, roles ...string) (*User, error) {
+	if err := s.verifyMutationActor(ctx, actorID); err != nil {
+		return nil, err
+	}
+	actor, err := s.GetUser(ctx, strings.TrimSpace(actorID))
+	if err != nil {
+		return nil, err
+	}
+	for _, role := range roles {
+		if canonicalRole(actor.Role) == canonicalRole(role) {
+			return actor, nil
+		}
+	}
+	return nil, fmt.Errorf("role %s is not authorized for this operation", actor.Role)
+}
+
 func transactionTime(ctx contractapi.TransactionContextInterface) string {
 	if timestamp, err := ctx.GetStub().GetTxTimestamp(); err == nil && timestamp != nil {
 		return timestamp.AsTime().UTC().Format(time.RFC3339)
@@ -212,18 +248,63 @@ func (s *SmartContract) putIdentityBinding(
 // ================================
 
 type Asset struct {
-	ID            string `json:"id"`
-	Name          string `json:"name"`
-	Type          string `json:"type"`
-	OwnerID       string `json:"ownerID"`
-	Value         int    `json:"value"`
-	Quantity      int    `json:"quantity"`
-	Status        string `json:"status"`
-	SerialNumber  string `json:"serialNumber"`
-	Description   string `json:"description"`
-	LastActorID   string `json:"lastActorID"`
-	LastOperation string `json:"lastOperation"`
-	Deleted       bool   `json:"deleted"`
+	ID               string `json:"id"`
+	Name             string `json:"name"`
+	Type             string `json:"type"`
+	OwnerID          string `json:"ownerID"`
+	Value            int    `json:"value"`
+	Quantity         int    `json:"quantity"`
+	ReservedQuantity int    `json:"reservedQuantity"`
+	Status           string `json:"status"`
+	SerialNumber     string `json:"serialNumber"`
+	Description      string `json:"description"`
+	LastActorID      string `json:"lastActorID"`
+	LastOperation    string `json:"lastOperation"`
+	Deleted          bool   `json:"deleted"`
+}
+
+// WorkflowRequest is a durable maker-checker record stored outside the asset
+// keyspace. Asset scans explicitly ignore its key prefix.
+type WorkflowRequest struct {
+	ID               string `json:"id"`
+	Type             string `json:"type"`
+	Status           string `json:"status"`
+	MakerID          string `json:"makerID"`
+	AssetID          string `json:"assetID"`
+	NewAssetID       string `json:"newAssetID,omitempty"`
+	TargetCustomerID string `json:"targetCustomerID,omitempty"`
+	Quantity         int    `json:"quantity"`
+	Name             string `json:"name,omitempty"`
+	AssetType        string `json:"assetType,omitempty"`
+	OwnerID          string `json:"ownerID,omitempty"`
+	Value            int    `json:"value,omitempty"`
+	AssetStatus      string `json:"assetStatus,omitempty"`
+	SerialNumber     string `json:"serialNumber,omitempty"`
+	Description      string `json:"description,omitempty"`
+	CreatedAt        string `json:"createdAt"`
+	UpdatedAt        string `json:"updatedAt"`
+	CheckerID        string `json:"checkerID,omitempty"`
+	CheckedAt        string `json:"checkedAt,omitempty"`
+	CustomerActorID  string `json:"customerActorID,omitempty"`
+	CustomerActedAt  string `json:"customerActedAt,omitempty"`
+	Reason           string `json:"reason,omitempty"`
+}
+
+func workflowRequestKey(id string) string   { return workflowRequestPrefix + strings.TrimSpace(id) }
+func workflowAssetLockKey(id string) string { return workflowAssetLockPrefix + strings.TrimSpace(id) }
+
+func terminalWorkflowStatus(status string) bool {
+	return status == statusCompleted || status == statusRejected || status == statusDeclined
+}
+
+func availableQuantity(asset *Asset) int { return asset.Quantity - asset.ReservedQuantity }
+
+func putWorkflowRequest(ctx contractapi.TransactionContextInterface, item *WorkflowRequest) error {
+	data, err := json.Marshal(item)
+	if err != nil {
+		return err
+	}
+	return ctx.GetStub().PutState(workflowRequestKey(item.ID), data)
 }
 
 // ================================
@@ -364,8 +445,24 @@ func (s *SmartContract) CreateUser(
 	contact string,
 	createdBy string,
 ) error {
-	if err := s.verifyMutationActor(ctx, createdBy); err != nil {
+	creator, err := s.actorWithRoles(ctx, createdBy, "admin", "manager", "sales")
+	if err != nil {
 		return err
+	}
+	requestedRole := canonicalRole(role)
+	allowed := false
+	switch canonicalRole(creator.Role) {
+	case "admin":
+		allowed = requestedRole == "admin" || requestedRole == "manager" ||
+			requestedRole == "sales" || requestedRole == "warehouse" ||
+			requestedRole == "customer"
+	case "manager":
+		allowed = requestedRole == "sales" || requestedRole == "warehouse"
+	case "sales":
+		allowed = requestedRole == "customer"
+	}
+	if !allowed {
+		return fmt.Errorf("role %s cannot create user with role %s", creator.Role, role)
 	}
 	username = strings.TrimSpace(username)
 	passwordHash = strings.TrimSpace(passwordHash)
@@ -434,9 +531,27 @@ func (s *SmartContract) UpdateUser(
 	if err := s.verifyMutationActor(ctx, actorID); err != nil {
 		return err
 	}
+	actor, err := s.GetUser(ctx, actorID)
+	if err != nil {
+		return err
+	}
 	user, err := s.GetUser(ctx, id)
 	if err != nil {
 		return err
+	}
+	requestedRole := canonicalRole(role)
+	actorRole := canonicalRole(actor.Role)
+	targetRole := canonicalRole(user.Role)
+	isSelfContactOnly := strings.TrimSpace(actorID) == strings.TrimSpace(id) &&
+		strings.TrimSpace(fullName) == strings.TrimSpace(user.FullName) &&
+		requestedRole == targetRole
+	allowed := actorRole == "admin" || isSelfContactOnly
+	if actorRole == "manager" && (targetRole == "sales" || targetRole == "warehouse") &&
+		(requestedRole == "sales" || requestedRole == "warehouse") {
+		allowed = true
+	}
+	if !allowed {
+		return fmt.Errorf("role %s is not authorized to update user %s", actor.Role, id)
 	}
 	user.FullName = strings.TrimSpace(fullName)
 	user.Role = strings.TrimSpace(role)
@@ -467,7 +582,7 @@ func (s *SmartContract) ensureStoreUser(ctx contractapi.TransactionContextInterf
 
 // EnsureStoreUser creates the non-login owner used for store inventory and buybacks.
 func (s *SmartContract) EnsureStoreUser(ctx contractapi.TransactionContextInterface, actorID string) error {
-	if err := s.verifyMutationActor(ctx, actorID); err != nil {
+	if _, err := s.actorWithRoles(ctx, actorID, "admin"); err != nil {
 		return err
 	}
 	return s.ensureStoreUser(ctx)
@@ -534,6 +649,13 @@ func (s *SmartContract) SetUserPassword(ctx contractapi.TransactionContextInterf
 	if err := s.verifyMutationActor(ctx, actorID); err != nil {
 		return err
 	}
+	actor, err := s.GetUser(ctx, actorID)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(actorID) != strings.TrimSpace(userID) && !strings.EqualFold(actor.Role, "admin") {
+		return fmt.Errorf("only the user or an admin may change this password")
+	}
 	user, err := s.GetUser(ctx, userID)
 	if err != nil {
 		return err
@@ -556,7 +678,7 @@ func (s *SmartContract) MigrateUserCredential(ctx contractapi.TransactionContext
 	if !credentialPrivateDataEnabled() {
 		return fmt.Errorf("userCredentials private-data collection is not enabled")
 	}
-	if err := s.verifyMutationActor(ctx, actorID); err != nil {
+	if _, err := s.actorWithRoles(ctx, actorID, "admin"); err != nil {
 		return err
 	}
 	key := "AUTH_" + strings.ToLower(strings.TrimSpace(username))
@@ -575,7 +697,7 @@ func (s *SmartContract) MigrateUserCredential(ctx contractapi.TransactionContext
 
 // DeleteUser removes a user and their credentials when no assets depend on them.
 func (s *SmartContract) DeleteUser(ctx contractapi.TransactionContextInterface, id string, actorID string) error {
-	if err := s.verifyMutationActor(ctx, actorID); err != nil {
+	if _, err := s.actorWithRoles(ctx, actorID, "admin"); err != nil {
 		return err
 	}
 	user, err := s.GetUser(ctx, id)
@@ -589,6 +711,18 @@ func (s *SmartContract) DeleteUser(ctx contractapi.TransactionContextInterface, 
 	}
 	if len(assets) > 0 {
 		return fmt.Errorf("user %s still owns %d asset(s)", id, len(assets))
+	}
+	requests, err := s.ListWorkflowRequests(ctx)
+	if err != nil {
+		return err
+	}
+	for _, item := range requests {
+		if terminalWorkflowStatus(item.Status) {
+			continue
+		}
+		if item.MakerID == id || item.OwnerID == id || item.TargetCustomerID == id || item.CheckerID == id || item.CustomerActorID == id {
+			return fmt.Errorf("user %s is referenced by nonterminal workflow request %s", id, item.ID)
+		}
 	}
 
 	if strings.EqualFold(user.Role, "admin") {
@@ -670,6 +804,417 @@ func (s *SmartContract) UserExists(
 	return data != nil, nil
 }
 
+// SubmitAssetCreationRequest lets warehouse staff propose inventory creation.
+// The requested asset ID is locked until the request reaches a terminal state.
+func (s *SmartContract) SubmitAssetCreationRequest(
+	ctx contractapi.TransactionContextInterface,
+	requestID string,
+	assetID string,
+	name string,
+	assetType string,
+	ownerID string,
+	value int,
+	status string,
+	serialNumber string,
+	description string,
+	quantity int,
+	actorID string,
+) (*WorkflowRequest, error) {
+	if _, err := s.actorWithRoles(ctx, actorID, "warehouse"); err != nil {
+		return nil, err
+	}
+	requestID = strings.TrimSpace(requestID)
+	assetID = strings.TrimSpace(assetID)
+	ownerID = strings.TrimSpace(ownerID)
+	if requestID == "" || assetID == "" || strings.TrimSpace(name) == "" || strings.TrimSpace(assetType) == "" {
+		return nil, fmt.Errorf("requestID, assetID, name and asset type are required")
+	}
+	if quantity < 1 || value < 1 {
+		return nil, fmt.Errorf("value and quantity must be at least 1")
+	}
+	if ownerID != "STORE" && ownerID != "U001" {
+		return nil, fmt.Errorf("creation request owner must be STORE or U001")
+	}
+	if existing, err := ctx.GetStub().GetState(workflowRequestKey(requestID)); err != nil {
+		return nil, err
+	} else if existing != nil {
+		return nil, fmt.Errorf("workflow request %s already exists", requestID)
+	}
+	if exists, err := s.AssetExists(ctx, assetID); err != nil {
+		return nil, err
+	} else if exists {
+		return nil, fmt.Errorf("asset %s already exists", assetID)
+	}
+	lockKey := workflowAssetLockKey(assetID)
+	if lock, err := ctx.GetStub().GetState(lockKey); err != nil {
+		return nil, err
+	} else if lock != nil {
+		return nil, fmt.Errorf("asset ID %s is locked by a pending request", assetID)
+	}
+	if ownerID == "STORE" {
+		if err := s.ensureStoreUser(ctx); err != nil {
+			return nil, err
+		}
+	}
+	if exists, err := s.UserExists(ctx, ownerID); err != nil {
+		return nil, err
+	} else if !exists {
+		return nil, fmt.Errorf("owner %s does not exist", ownerID)
+	}
+	now := transactionTime(ctx)
+	item := &WorkflowRequest{
+		ID: requestID, Type: requestTypeCreation, Status: statusPendingApproval,
+		MakerID: strings.TrimSpace(actorID), AssetID: assetID, Quantity: quantity,
+		Name: strings.TrimSpace(name), AssetType: strings.TrimSpace(assetType), OwnerID: ownerID,
+		Value: value, AssetStatus: strings.TrimSpace(status), SerialNumber: strings.TrimSpace(serialNumber),
+		Description: strings.TrimSpace(description), CreatedAt: now, UpdatedAt: now,
+	}
+	if err := putWorkflowRequest(ctx, item); err != nil {
+		return nil, err
+	}
+	if err := ctx.GetStub().PutState(lockKey, []byte(requestID)); err != nil {
+		return nil, err
+	}
+	return item, nil
+}
+
+// SubmitInventoryTransferRequest reserves store inventory immediately.
+func (s *SmartContract) SubmitInventoryTransferRequest(
+	ctx contractapi.TransactionContextInterface,
+	requestID string,
+	assetID string,
+	targetCustomerID string,
+	quantity int,
+	newAssetID string,
+	actorID string,
+) (*WorkflowRequest, error) {
+	if _, err := s.actorWithRoles(ctx, actorID, "sales"); err != nil {
+		return nil, err
+	}
+	requestID = strings.TrimSpace(requestID)
+	assetID = strings.TrimSpace(assetID)
+	targetCustomerID = strings.TrimSpace(targetCustomerID)
+	newAssetID = strings.TrimSpace(newAssetID)
+	if requestID == "" || assetID == "" || targetCustomerID == "" {
+		return nil, fmt.Errorf("requestID, assetID and target customer are required")
+	}
+	if existing, err := ctx.GetStub().GetState(workflowRequestKey(requestID)); err != nil {
+		return nil, err
+	} else if existing != nil {
+		return nil, fmt.Errorf("workflow request %s already exists", requestID)
+	}
+	asset, err := s.ReadAsset(ctx, assetID)
+	if err != nil {
+		return nil, err
+	}
+	if asset.OwnerID != "STORE" && asset.OwnerID != "U001" {
+		return nil, fmt.Errorf("only STORE or U001 inventory may be submitted")
+	}
+	if quantity < 1 || quantity > availableQuantity(asset) {
+		return nil, fmt.Errorf("quantity must be between 1 and %d", availableQuantity(asset))
+	}
+	customer, err := s.GetUser(ctx, targetCustomerID)
+	if err != nil {
+		return nil, err
+	}
+	if canonicalRole(customer.Role) != "customer" {
+		return nil, fmt.Errorf("target user must be a customer")
+	}
+	if quantity < asset.Quantity && newAssetID == "" {
+		return nil, fmt.Errorf("new asset ID is required for a partial transfer")
+	}
+	if quantity == asset.Quantity && newAssetID != "" {
+		return nil, fmt.Errorf("new asset ID is only allowed for a partial transfer")
+	}
+	if newAssetID != "" {
+		if newAssetID == assetID {
+			return nil, fmt.Errorf("new asset ID must differ from source asset ID")
+		}
+		if exists, err := s.AssetExists(ctx, newAssetID); err != nil {
+			return nil, err
+		} else if exists {
+			return nil, fmt.Errorf("asset %s already exists", newAssetID)
+		}
+		if lock, err := ctx.GetStub().GetState(workflowAssetLockKey(newAssetID)); err != nil {
+			return nil, err
+		} else if lock != nil {
+			return nil, fmt.Errorf("asset ID %s is locked by a pending request", newAssetID)
+		}
+	}
+	asset.ReservedQuantity += quantity
+	asset.LastActorID = strings.TrimSpace(actorID)
+	asset.LastOperation = "reserve"
+	assetData, err := json.Marshal(asset)
+	if err != nil {
+		return nil, err
+	}
+	if err := ctx.GetStub().PutState(asset.ID, assetData); err != nil {
+		return nil, err
+	}
+	now := transactionTime(ctx)
+	item := &WorkflowRequest{
+		ID: requestID, Type: requestTypeTransfer, Status: statusPendingApproval,
+		MakerID: strings.TrimSpace(actorID), AssetID: assetID, NewAssetID: newAssetID,
+		TargetCustomerID: targetCustomerID, Quantity: quantity, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := putWorkflowRequest(ctx, item); err != nil {
+		return nil, err
+	}
+	if newAssetID != "" {
+		if err := ctx.GetStub().PutState(workflowAssetLockKey(newAssetID), []byte(requestID)); err != nil {
+			return nil, err
+		}
+	}
+	return item, nil
+}
+
+func (s *SmartContract) ReadWorkflowRequest(ctx contractapi.TransactionContextInterface, requestID string) (*WorkflowRequest, error) {
+	data, err := ctx.GetStub().GetState(workflowRequestKey(requestID))
+	if err != nil {
+		return nil, err
+	}
+	if data == nil {
+		return nil, fmt.Errorf("workflow request %s does not exist", requestID)
+	}
+	var item WorkflowRequest
+	if err := json.Unmarshal(data, &item); err != nil {
+		return nil, err
+	}
+	return &item, nil
+}
+
+func (s *SmartContract) ListWorkflowRequests(ctx contractapi.TransactionContextInterface) ([]*WorkflowRequest, error) {
+	iterator, err := ctx.GetStub().GetStateByRange(workflowRequestPrefix, workflowRequestPrefix+"\uffff")
+	if err != nil {
+		return nil, err
+	}
+	defer iterator.Close()
+	items := make([]*WorkflowRequest, 0)
+	for iterator.HasNext() {
+		entry, err := iterator.Next()
+		if err != nil {
+			return nil, err
+		}
+		var item WorkflowRequest
+		if err := json.Unmarshal(entry.Value, &item); err == nil && item.ID != "" {
+			items = append(items, &item)
+		}
+	}
+	return items, nil
+}
+
+func releaseWorkflowReservation(ctx contractapi.TransactionContextInterface, item *WorkflowRequest, actorID string) error {
+	asset, err := (&SmartContract{}).ReadAsset(ctx, item.AssetID)
+	if err != nil {
+		return err
+	}
+	if item.Quantity < 1 || asset.ReservedQuantity < item.Quantity {
+		return fmt.Errorf("reservation state is inconsistent for asset %s", item.AssetID)
+	}
+	asset.ReservedQuantity -= item.Quantity
+	asset.LastActorID = strings.TrimSpace(actorID)
+	asset.LastOperation = "release_reservation"
+	data, err := json.Marshal(asset)
+	if err != nil {
+		return err
+	}
+	return ctx.GetStub().PutState(asset.ID, data)
+}
+
+func unlockWorkflowAssetID(ctx contractapi.TransactionContextInterface, item *WorkflowRequest) error {
+	lockedID := item.NewAssetID
+	if item.Type == requestTypeCreation {
+		lockedID = item.AssetID
+	}
+	if strings.TrimSpace(lockedID) == "" {
+		return nil
+	}
+	return ctx.GetStub().DelState(workflowAssetLockKey(lockedID))
+}
+
+func (s *SmartContract) ApproveWorkflowRequest(ctx contractapi.TransactionContextInterface, requestID string, reason string, actorID string) (*WorkflowRequest, error) {
+	if _, err := s.actorWithRoles(ctx, actorID, "manager", "admin"); err != nil {
+		return nil, err
+	}
+	item, err := s.ReadWorkflowRequest(ctx, requestID)
+	if err != nil {
+		return nil, err
+	}
+	if item.Status != statusPendingApproval {
+		return nil, fmt.Errorf("request is not pending approval")
+	}
+	if strings.TrimSpace(item.MakerID) == strings.TrimSpace(actorID) {
+		return nil, fmt.Errorf("maker cannot approve own request")
+	}
+	now := transactionTime(ctx)
+	item.CheckerID, item.CheckedAt, item.UpdatedAt, item.Reason = strings.TrimSpace(actorID), now, now, strings.TrimSpace(reason)
+	if item.Type == requestTypeCreation {
+		if exists, err := s.AssetExists(ctx, item.AssetID); err != nil {
+			return nil, err
+		} else if exists {
+			return nil, fmt.Errorf("asset %s already exists", item.AssetID)
+		}
+		asset := &Asset{
+			ID: item.AssetID, Name: item.Name, Type: item.AssetType, OwnerID: item.OwnerID,
+			Value: item.Value, Quantity: item.Quantity, Status: item.AssetStatus,
+			SerialNumber: item.SerialNumber, Description: item.Description,
+			LastActorID: strings.TrimSpace(actorID), LastOperation: "create",
+		}
+		data, err := json.Marshal(asset)
+		if err != nil {
+			return nil, err
+		}
+		if err := ctx.GetStub().PutState(asset.ID, data); err != nil {
+			return nil, err
+		}
+		item.Status = statusCompleted
+		if err := unlockWorkflowAssetID(ctx, item); err != nil {
+			return nil, err
+		}
+	} else if item.Type == requestTypeTransfer {
+		item.Status = statusAwaitingCustomer
+	} else {
+		return nil, fmt.Errorf("unsupported workflow request type")
+	}
+	if err := putWorkflowRequest(ctx, item); err != nil {
+		return nil, err
+	}
+	return item, nil
+}
+
+func (s *SmartContract) RejectWorkflowRequest(ctx contractapi.TransactionContextInterface, requestID string, reason string, actorID string) (*WorkflowRequest, error) {
+	if _, err := s.actorWithRoles(ctx, actorID, "manager", "admin"); err != nil {
+		return nil, err
+	}
+	item, err := s.ReadWorkflowRequest(ctx, requestID)
+	if err != nil {
+		return nil, err
+	}
+	if item.Status != statusPendingApproval {
+		return nil, fmt.Errorf("request is not pending approval")
+	}
+	if strings.TrimSpace(item.MakerID) == strings.TrimSpace(actorID) {
+		return nil, fmt.Errorf("maker cannot reject own request")
+	}
+	if item.Type == requestTypeTransfer {
+		if err := releaseWorkflowReservation(ctx, item, actorID); err != nil {
+			return nil, err
+		}
+	}
+	if err := unlockWorkflowAssetID(ctx, item); err != nil {
+		return nil, err
+	}
+	now := transactionTime(ctx)
+	item.Status, item.CheckerID, item.CheckedAt, item.UpdatedAt, item.Reason = statusRejected, strings.TrimSpace(actorID), now, now, strings.TrimSpace(reason)
+	if err := putWorkflowRequest(ctx, item); err != nil {
+		return nil, err
+	}
+	return item, nil
+}
+
+func (s *SmartContract) AcceptWorkflowRequest(ctx contractapi.TransactionContextInterface, requestID string, reason string, actorID string) (*WorkflowRequest, error) {
+	if _, err := s.actorWithRoles(ctx, actorID, "customer"); err != nil {
+		return nil, err
+	}
+	item, err := s.ReadWorkflowRequest(ctx, requestID)
+	if err != nil {
+		return nil, err
+	}
+	if item.Type != requestTypeTransfer || item.Status != statusAwaitingCustomer {
+		return nil, fmt.Errorf("request is not awaiting customer acceptance")
+	}
+	if item.TargetCustomerID != strings.TrimSpace(actorID) {
+		return nil, fmt.Errorf("only the target customer may accept this request")
+	}
+	asset, err := s.ReadAsset(ctx, item.AssetID)
+	if err != nil {
+		return nil, err
+	}
+	if asset.ReservedQuantity < item.Quantity || item.Quantity > asset.Quantity {
+		return nil, fmt.Errorf("reservation state is inconsistent for asset %s", item.AssetID)
+	}
+	asset.ReservedQuantity -= item.Quantity
+	if item.Quantity == asset.Quantity {
+		if asset.ReservedQuantity != 0 {
+			return nil, fmt.Errorf("cannot transfer whole asset while other reservations exist")
+		}
+		asset.OwnerID = item.TargetCustomerID
+		asset.Status = "Sold"
+		asset.LastActorID = strings.TrimSpace(actorID)
+		asset.LastOperation = "transfer"
+		data, err := json.Marshal(asset)
+		if err != nil {
+			return nil, err
+		}
+		if err := ctx.GetStub().PutState(asset.ID, data); err != nil {
+			return nil, err
+		}
+	} else {
+		if strings.TrimSpace(item.NewAssetID) == "" {
+			return nil, fmt.Errorf("new asset ID is required for a partial transfer")
+		}
+		sold := *asset
+		sold.ID, sold.OwnerID, sold.Quantity, sold.ReservedQuantity = item.NewAssetID, item.TargetCustomerID, item.Quantity, 0
+		sold.Status, sold.LastActorID, sold.LastOperation = "Sold", strings.TrimSpace(actorID), "transfer"
+		asset.Quantity -= item.Quantity
+		asset.LastActorID, asset.LastOperation = strings.TrimSpace(actorID), "update"
+		remainingData, err := json.Marshal(asset)
+		if err != nil {
+			return nil, err
+		}
+		soldData, err := json.Marshal(&sold)
+		if err != nil {
+			return nil, err
+		}
+		if err := ctx.GetStub().PutState(asset.ID, remainingData); err != nil {
+			return nil, err
+		}
+		if err := ctx.GetStub().PutState(sold.ID, soldData); err != nil {
+			return nil, err
+		}
+	}
+	if err := unlockWorkflowAssetID(ctx, item); err != nil {
+		return nil, err
+	}
+	now := transactionTime(ctx)
+	item.Status, item.CustomerActorID, item.CustomerActedAt, item.UpdatedAt = statusCompleted, strings.TrimSpace(actorID), now, now
+	if strings.TrimSpace(reason) != "" {
+		item.Reason = strings.TrimSpace(reason)
+	}
+	if err := putWorkflowRequest(ctx, item); err != nil {
+		return nil, err
+	}
+	return item, nil
+}
+
+func (s *SmartContract) DeclineWorkflowRequest(ctx contractapi.TransactionContextInterface, requestID string, reason string, actorID string) (*WorkflowRequest, error) {
+	if _, err := s.actorWithRoles(ctx, actorID, "customer"); err != nil {
+		return nil, err
+	}
+	item, err := s.ReadWorkflowRequest(ctx, requestID)
+	if err != nil {
+		return nil, err
+	}
+	if item.Type != requestTypeTransfer || item.Status != statusAwaitingCustomer {
+		return nil, fmt.Errorf("request is not awaiting customer acceptance")
+	}
+	if item.TargetCustomerID != strings.TrimSpace(actorID) {
+		return nil, fmt.Errorf("only the target customer may decline this request")
+	}
+	if err := releaseWorkflowReservation(ctx, item, actorID); err != nil {
+		return nil, err
+	}
+	if err := unlockWorkflowAssetID(ctx, item); err != nil {
+		return nil, err
+	}
+	now := transactionTime(ctx)
+	item.Status, item.CustomerActorID, item.CustomerActedAt, item.UpdatedAt, item.Reason = statusDeclined, strings.TrimSpace(actorID), now, now, strings.TrimSpace(reason)
+	if err := putWorkflowRequest(ctx, item); err != nil {
+		return nil, err
+	}
+	return item, nil
+}
+
 // ================================
 // ASSET FUNCTIONS
 // ================================
@@ -688,7 +1233,7 @@ func (s *SmartContract) CreateAsset(
 	quantity int,
 	actorID string,
 ) error {
-	if err := s.verifyMutationActor(ctx, actorID); err != nil {
+	if _, err := s.actorWithRoles(ctx, actorID, "admin"); err != nil {
 		return err
 	}
 	if quantity < 1 {
@@ -707,6 +1252,11 @@ func (s *SmartContract) CreateAsset(
 
 	if exists {
 		return fmt.Errorf("asset %s already exists", id)
+	}
+	if lock, err := ctx.GetStub().GetState(workflowAssetLockKey(id)); err != nil {
+		return err
+	} else if lock != nil {
+		return fmt.Errorf("asset ID %s is locked by a pending request", id)
 	}
 
 	// Check owner
@@ -780,6 +1330,9 @@ func (s *SmartContract) ReadAssetRecord(
 	if asset.Quantity < 1 {
 		asset.Quantity = 1
 	}
+	if asset.ReservedQuantity < 0 || asset.ReservedQuantity > asset.Quantity {
+		return nil, fmt.Errorf("asset %s has invalid reserved quantity", id)
+	}
 
 	return &asset, nil
 }
@@ -798,7 +1351,7 @@ func (s *SmartContract) UpdateAsset(
 	quantity int,
 	actorID string,
 ) error {
-	if err := s.verifyMutationActor(ctx, actorID); err != nil {
+	if _, err := s.actorWithRoles(ctx, actorID, "admin", "manager", "warehouse"); err != nil {
 		return err
 	}
 	if quantity < 1 {
@@ -818,6 +1371,16 @@ func (s *SmartContract) UpdateAsset(
 	if !exists {
 		return fmt.Errorf("asset %s does not exist", id)
 	}
+	existingAsset, err := s.ReadAsset(ctx, id)
+	if err != nil {
+		return err
+	}
+	if ownerID != existingAsset.OwnerID {
+		return fmt.Errorf("asset ownership must be changed through an authorized transfer")
+	}
+	if existingAsset.ReservedQuantity > 0 {
+		return fmt.Errorf("asset has %d reserved item(s) and cannot be updated", existingAsset.ReservedQuantity)
+	}
 
 	ownerExists, err := s.UserExists(ctx, ownerID)
 	if err != nil {
@@ -829,17 +1392,18 @@ func (s *SmartContract) UpdateAsset(
 	}
 
 	asset := Asset{
-		ID:            id,
-		Name:          name,
-		Type:          assetType,
-		OwnerID:       ownerID,
-		Value:         value,
-		Quantity:      quantity,
-		Status:        status,
-		SerialNumber:  serialNumber,
-		Description:   description,
-		LastActorID:   strings.TrimSpace(actorID),
-		LastOperation: "update",
+		ID:               id,
+		Name:             name,
+		Type:             assetType,
+		OwnerID:          ownerID,
+		Value:            value,
+		Quantity:         quantity,
+		ReservedQuantity: existingAsset.ReservedQuantity,
+		Status:           status,
+		SerialNumber:     serialNumber,
+		Description:      description,
+		LastActorID:      strings.TrimSpace(actorID),
+		LastOperation:    "update",
 	}
 
 	data, err := json.Marshal(asset)
@@ -856,22 +1420,19 @@ func (s *SmartContract) DeleteAsset(
 	id string,
 	actorID string,
 ) error {
-	if err := s.verifyMutationActor(ctx, actorID); err != nil {
-		return err
-	}
-
-	exists, err := s.AssetExists(ctx, id)
-	if err != nil {
-		return err
-	}
-
-	if !exists {
-		return fmt.Errorf("asset %s does not exist", id)
-	}
-
 	asset, err := s.ReadAsset(ctx, id)
 	if err != nil {
 		return err
+	}
+	actor, err := s.actorWithRoles(ctx, actorID, "admin", "customer")
+	if err != nil {
+		return err
+	}
+	if strings.EqualFold(actor.Role, "customer") && asset.OwnerID != actor.ID {
+		return fmt.Errorf("customer may only delete owned assets")
+	}
+	if asset.ReservedQuantity > 0 {
+		return fmt.Errorf("asset has %d reserved item(s)", asset.ReservedQuantity)
 	}
 	asset.Deleted = true
 	asset.LastActorID = strings.TrimSpace(actorID)
@@ -890,15 +1451,19 @@ func (s *SmartContract) DeleteAssetQuantity(
 	quantity int,
 	actorID string,
 ) error {
-	if err := s.verifyMutationActor(ctx, actorID); err != nil {
-		return err
-	}
 	asset, err := s.ReadAsset(ctx, id)
 	if err != nil {
 		return err
 	}
-	if quantity < 1 || quantity > asset.Quantity {
-		return fmt.Errorf("quantity must be between 1 and %d", asset.Quantity)
+	actor, err := s.actorWithRoles(ctx, actorID, "admin", "customer")
+	if err != nil {
+		return err
+	}
+	if strings.EqualFold(actor.Role, "customer") && asset.OwnerID != actor.ID {
+		return fmt.Errorf("customer may only delete owned assets")
+	}
+	if quantity < 1 || quantity > availableQuantity(asset) {
+		return fmt.Errorf("quantity must be between 1 and %d", availableQuantity(asset))
 	}
 	if quantity == asset.Quantity {
 		asset.Deleted = true
@@ -945,7 +1510,7 @@ func (s *SmartContract) TransferAsset(
 	newOwnerID string,
 	actorID string,
 ) error {
-	if err := s.verifyMutationActor(ctx, actorID); err != nil {
+	if _, err := s.actorWithRoles(ctx, actorID, "admin"); err != nil {
 		return err
 	}
 	if newOwnerID == "STORE" {
@@ -957,6 +1522,9 @@ func (s *SmartContract) TransferAsset(
 	asset, err := s.ReadAsset(ctx, id)
 	if err != nil {
 		return err
+	}
+	if asset.ReservedQuantity > 0 {
+		return fmt.Errorf("asset has %d reserved item(s)", asset.ReservedQuantity)
 	}
 
 	ownerExists, err := s.UserExists(ctx, newOwnerID)
@@ -982,12 +1550,18 @@ func (s *SmartContract) TransferAsset(
 
 // ReturnAssetToStore transfers a customer asset back into store inventory.
 func (s *SmartContract) ReturnAssetToStore(ctx contractapi.TransactionContextInterface, id string, actorID string) error {
-	if err := s.verifyMutationActor(ctx, actorID); err != nil {
+	if _, err := s.actorWithRoles(ctx, actorID, "customer"); err != nil {
 		return err
 	}
 	asset, err := s.ReadAsset(ctx, id)
 	if err != nil {
 		return err
+	}
+	if asset.OwnerID != strings.TrimSpace(actorID) {
+		return fmt.Errorf("customer may only return an owned asset")
+	}
+	if asset.ReservedQuantity > 0 {
+		return fmt.Errorf("asset has %d reserved item(s)", asset.ReservedQuantity)
 	}
 	if err := s.ensureStoreUser(ctx); err != nil {
 		return err
@@ -1012,7 +1586,7 @@ func (s *SmartContract) TransferAssetQuantity(
 	newAssetID string,
 	actorID string,
 ) error {
-	if err := s.verifyMutationActor(ctx, actorID); err != nil {
+	if _, err := s.actorWithRoles(ctx, actorID, "admin"); err != nil {
 		return err
 	}
 	if newOwnerID == "STORE" {
@@ -1024,8 +1598,11 @@ func (s *SmartContract) TransferAssetQuantity(
 	if err != nil {
 		return err
 	}
-	if quantity < 1 || quantity > asset.Quantity {
-		return fmt.Errorf("quantity must be between 1 and %d", asset.Quantity)
+	if asset.ReservedQuantity > 0 {
+		return fmt.Errorf("asset has %d reserved item(s)", asset.ReservedQuantity)
+	}
+	if quantity < 1 || quantity > availableQuantity(asset) {
+		return fmt.Errorf("quantity must be between 1 and %d", availableQuantity(asset))
 	}
 	ownerExists, err := s.UserExists(ctx, newOwnerID)
 	if err != nil {
@@ -1036,6 +1613,9 @@ func (s *SmartContract) TransferAssetQuantity(
 	}
 
 	if quantity == asset.Quantity {
+		if asset.ReservedQuantity > 0 {
+			return fmt.Errorf("asset has %d reserved item(s)", asset.ReservedQuantity)
+		}
 		asset.OwnerID = newOwnerID
 		asset.LastActorID = strings.TrimSpace(actorID)
 		asset.LastOperation = "transfer"
@@ -1056,6 +1636,11 @@ func (s *SmartContract) TransferAssetQuantity(
 	}
 	if exists {
 		return fmt.Errorf("asset %s already exists", newAssetID)
+	}
+	if lock, err := ctx.GetStub().GetState(workflowAssetLockKey(newAssetID)); err != nil {
+		return err
+	} else if lock != nil {
+		return fmt.Errorf("asset ID %s is locked by a pending request", newAssetID)
 	}
 
 	soldAsset := *asset
@@ -1109,9 +1694,11 @@ func (s *SmartContract) GetAssetsByOwner(
 			return nil, err
 		}
 
-		// Bỏ qua User
-		if len(queryResponse.Key) >= 5 &&
-			queryResponse.Key[:5] == "USER_" {
+		if strings.HasPrefix(queryResponse.Key, "USER_") ||
+			strings.HasPrefix(queryResponse.Key, workflowRequestPrefix) ||
+			strings.HasPrefix(queryResponse.Key, workflowAssetLockPrefix) ||
+			strings.HasPrefix(queryResponse.Key, "IDENTITY_") ||
+			strings.HasPrefix(queryResponse.Key, "AUTH_") {
 			continue
 		}
 
@@ -1173,9 +1760,11 @@ func (s *SmartContract) GetAllAssets(
 			return nil, err
 		}
 
-		// Bỏ qua dữ liệu User
-		if len(queryResponse.Key) >= 5 &&
-			queryResponse.Key[:5] == "USER_" {
+		if strings.HasPrefix(queryResponse.Key, "USER_") ||
+			strings.HasPrefix(queryResponse.Key, workflowRequestPrefix) ||
+			strings.HasPrefix(queryResponse.Key, workflowAssetLockPrefix) ||
+			strings.HasPrefix(queryResponse.Key, "IDENTITY_") ||
+			strings.HasPrefix(queryResponse.Key, "AUTH_") {
 			continue
 		}
 
@@ -1228,7 +1817,11 @@ func (s *SmartContract) GetAllAssetRecords(
 			return nil, err
 		}
 		if strings.HasPrefix(queryResponse.Key, "USER_") ||
-			strings.HasPrefix(queryResponse.Key, "USER_CREDENTIAL_") {
+			strings.HasPrefix(queryResponse.Key, "USER_CREDENTIAL_") ||
+			strings.HasPrefix(queryResponse.Key, workflowRequestPrefix) ||
+			strings.HasPrefix(queryResponse.Key, workflowAssetLockPrefix) ||
+			strings.HasPrefix(queryResponse.Key, "IDENTITY_") ||
+			strings.HasPrefix(queryResponse.Key, "AUTH_") {
 			continue
 		}
 		var asset Asset

@@ -255,6 +255,14 @@ tbody tr:hover td { background: rgba(255,255,255,.025); }
 .status.pending, .request-status.pending { background: rgba(255,174,76,.1); color: var(--orange); }
 .request-status.processing { background: rgba(109,106,255,.12); color: #aaa8ff; }
 .status.inactive, .request-status.rejected, .request-status.failed { background: rgba(255,107,120,.1); color: #ff9da6; }
+.request-status.pending_approval { background: rgba(255,174,76,.12); color: var(--orange); }
+.request-status.awaiting_customer { background: rgba(101,217,255,.12); color: var(--cyan); }
+.request-status.completed { background: rgba(119,230,165,.12); color: var(--success); }
+.request-status.declined { background: rgba(255,107,120,.1); color: #ff9da6; }
+.workflow-table table { min-width: 880px; }
+.request-section-title { margin: 30px 0 12px; font-size: 18px; }
+.request-reason { max-width: 220px; margin-top: 7px; color: var(--muted); font-size: 10px; line-height: 1.45; }
+.workflow-hint { padding: 11px 13px; border: 1px solid rgba(101,217,255,.2); border-radius: 12px; background: rgba(101,217,255,.07); color: var(--muted); font-size: 11px; }
 .empty { padding: 42px !important; color: var(--subtle) !important; text-align: center; }
 .transaction-detail { min-width: 280px; line-height: 1.6; }
 

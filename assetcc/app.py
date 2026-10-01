@@ -246,6 +246,12 @@ MUTATION_ACTOR_ARGUMENT_INDEX = {
     "EnsureStoreUser": 0,
     "RegisterUserIdentity": 3,
     "RotateUserIdentity": 3,
+    "SubmitAssetCreationRequest": 10,
+    "SubmitInventoryTransferRequest": 5,
+    "ApproveWorkflowRequest": 2,
+    "RejectWorkflowRequest": 2,
+    "AcceptWorkflowRequest": 2,
+    "DeclineWorkflowRequest": 2,
 }
 
 
@@ -930,6 +936,9 @@ MUTATING_CHAINCODE_FUNCTIONS = {
     "SetUserPassword", "MigrateUserCredential", "TransferAsset", "TransferAssetQuantity",
     "UpdateAsset", "UpdateUser", "ReturnAssetToStore", "DeleteAssetQuantity",
     "EnsureStoreUser", "RegisterUserIdentity", "RotateUserIdentity",
+    "SubmitAssetCreationRequest", "SubmitInventoryTransferRequest",
+    "ApproveWorkflowRequest", "RejectWorkflowRequest",
+    "AcceptWorkflowRequest", "DeclineWorkflowRequest",
 }
 
 
@@ -1480,6 +1489,147 @@ def read_chaincode_asset_record(asset_id):
         return None, result
     asset = parse_chaincode_result(result)
     return asset if isinstance(asset, dict) else None, result
+
+
+def workflow_request_id(kind):
+    idempotency_key = request.headers.get("Idempotency-Key", "").strip()
+    actor_id = str(request.auth_user.get("id", "")).strip()
+    if idempotency_key:
+        if len(idempotency_key) > 128 or not all(
+            character.isalnum() or character in "-_.:" for character in idempotency_key
+        ):
+            return None
+        digest = hashlib.sha256(
+            f"{actor_id}\x00{kind}\x00{idempotency_key}".encode()
+        ).hexdigest()[:24]
+        return f"WF-{kind[:3].upper()}-{digest}"
+    return f"WF-{kind[:3].upper()}-{token_urlsafe(18)}"
+
+
+def workflow_error_response(result, fallback):
+    raw_message = str(
+        result.get("error")
+        or response_object(result.get("data", {})).get("message", "")
+        or fallback
+    )
+    lowered = raw_message.lower()
+    status_code = int(result.get("status_code") or 0)
+    if not status_code:
+        if "does not exist" in lowered or "không tồn tại" in lowered:
+            status_code = 404
+        elif any(value in lowered for value in (
+            "already exists", "locked", "not pending", "not awaiting",
+            "reservation state", "nonterminal", "duplicate",
+        )):
+            status_code = 409
+        elif any(value in lowered for value in (
+            "not authorized", "only ", "cannot approve own", "cannot reject own",
+            "does not match invoker", "identity",
+        )):
+            status_code = 403
+        else:
+            status_code = 400
+    if status_code >= 500:
+        status_code = 502
+    return jsonify({
+        "status": "error", "message": raw_message,
+        "fabric_response": result,
+    }), status_code
+
+
+def visible_workflow_requests(identity, items):
+    role = normalize_role(identity.get("role"))
+    actor_id = str(identity.get("id", ""))
+    if role in {"admin", "manager"}:
+        return items
+    if role in {"warehouse", "sales"}:
+        return [item for item in items if str(item.get("makerID")) == actor_id]
+    if role == "customer":
+        return [
+            item for item in items
+            if str(item.get("targetCustomerID")) == actor_id
+        ]
+    return []
+
+
+def list_visible_workflow_requests():
+    result = invoke_chaincode("ListWorkflowRequests", [])
+    items = parse_chaincode_result(result)
+    if not result.get("success") or not isinstance(items, list):
+        return None, result
+    return visible_workflow_requests(request.auth_user, items), result
+
+
+def submit_creation_workflow(body):
+    required = ("id", "name", "type", "value", "quantity", "status")
+    missing = next((field for field in required if body.get(field) in (None, "")), None)
+    if missing:
+        return None, jsonify({"status": "error", "message": f"Thiếu trường {missing}"}), 400
+    try:
+        value, quantity = int(body["value"]), int(body["quantity"])
+    except (TypeError, ValueError):
+        return None, jsonify({"status": "error", "message": "Giá và số lượng phải là số"}), 400
+    if value < 1 or quantity < 1 or value > 9_000_000_000_000_000:
+        return None, jsonify({"status": "error", "message": "Giá và số lượng không hợp lệ"}), 400
+    request_id = workflow_request_id("creation")
+    if request_id is None:
+        return None, jsonify({"status": "error", "message": "Idempotency-Key không hợp lệ"}), 400
+    owner_id = str(body.get("ownerID") or STORE_USER_ID)
+    args = [
+        request_id, str(body["id"]), str(body["name"]), str(body["type"]),
+        owner_id, str(value), str(body["status"]),
+        str(body.get("serialNumber", "")), str(body.get("description", "")),
+        str(quantity), str(request.auth_user.get("id", "")),
+    ]
+    result = invoke_chaincode("SubmitAssetCreationRequest", args)
+    if not result.get("success"):
+        return None, workflow_error_response(result, "Không thể gửi yêu cầu tạo tài sản"), None
+    item = parse_chaincode_result(result)
+    return item if isinstance(item, dict) else {"id": request_id}, None, 201
+
+
+def submit_transfer_workflow(body, asset_id=None, existing_asset=None):
+    source_id = str(asset_id or body.get("assetID") or "").strip()
+    target_id = str(body.get("newOwnerID") or body.get("targetCustomerID") or "").strip()
+    if not source_id or not target_id or body.get("quantity") in (None, ""):
+        return None, jsonify({
+            "status": "error",
+            "message": "assetID, targetCustomerID và quantity là bắt buộc",
+        }), 400
+    asset = existing_asset
+    if asset is None:
+        asset, _ = read_chaincode_asset(source_id)
+    if not asset:
+        return None, jsonify({"status": "error", "message": "Tài sản không tồn tại"}), 404
+    if str(asset.get("ownerID")) not in {STORE_USER_ID, ADMIN_OWNER_ID}:
+        return None, jsonify({"status": "error", "message": "Chỉ có thể bán hàng tồn kho STORE/U001"}), 400
+    recipient_result = invoke_chaincode("GetUser", [target_id])
+    recipient = parse_chaincode_result(recipient_result)
+    if (
+        not recipient_result.get("success") or not isinstance(recipient, dict)
+        or normalize_role(recipient.get("role")) != "customer"
+    ):
+        return None, jsonify({"status": "error", "message": "Phải chọn khách hàng hiện có"}), 400
+    try:
+        quantity = int(body["quantity"])
+    except (TypeError, ValueError):
+        return None, jsonify({"status": "error", "message": "Số lượng bán không hợp lệ"}), 400
+    if quantity < 1:
+        return None, jsonify({"status": "error", "message": "Số lượng bán phải lớn hơn 0"}), 400
+    new_asset_id = str(body.get("newAssetID") or "").strip()
+    if quantity < int(asset.get("quantity") or 1) and not new_asset_id:
+        return None, jsonify({"status": "error", "message": "Thiếu mã tài sản mới khi bán một phần"}), 400
+    request_id = workflow_request_id("transfer")
+    if request_id is None:
+        return None, jsonify({"status": "error", "message": "Idempotency-Key không hợp lệ"}), 400
+    result = invoke_chaincode("SubmitInventoryTransferRequest", [
+        request_id, source_id, target_id, str(quantity), new_asset_id,
+        str(request.auth_user.get("id", "")),
+    ])
+    if not result.get("success"):
+        return None, workflow_error_response(result, "Không thể gửi yêu cầu chuyển kho"), None
+    item = parse_chaincode_result(result)
+    return item if isinstance(item, dict) else {"id": request_id}, None, 201
 
 
 def user_reference(user_id, directory):
@@ -2250,6 +2400,103 @@ def complete_fabric_identity_bootstrap(user_id):
     })
 
 
+@app.route("/api/workflow/asset-creation-requests", methods=["POST"])
+@require_auth(permission="create_asset")
+def create_asset_creation_request():
+    if normalize_role(request.auth_user.get("role")) != "warehouse":
+        return jsonify({"status": "error", "message": "Chỉ nhân viên kho được gửi yêu cầu tạo tài sản"}), 403
+    item, error_response, status_code = submit_creation_workflow(
+        request.get_json(silent=True) or {}
+    )
+    if item is None:
+        return error_response if status_code is None else (error_response, status_code)
+    return jsonify({
+        "status": "success", "message": "Đã gửi yêu cầu tạo tài sản",
+        "data": item,
+    }), status_code
+
+
+@app.route("/api/workflow/transfer-requests", methods=["POST"])
+@require_auth(permission="transfer_asset")
+def create_transfer_request():
+    if normalize_role(request.auth_user.get("role")) != "sales":
+        return jsonify({"status": "error", "message": "Chỉ nhân viên bán hàng được gửi yêu cầu chuyển kho"}), 403
+    item, error_response, status_code = submit_transfer_workflow(
+        request.get_json(silent=True) or {}
+    )
+    if item is None:
+        return error_response if status_code is None else (error_response, status_code)
+    return jsonify({
+        "status": "success", "message": "Đã gửi yêu cầu chuyển tài sản",
+        "data": item,
+    }), status_code
+
+
+@app.route("/api/workflow/requests", methods=["GET"])
+@require_auth()
+def get_workflow_requests():
+    if normalize_role(request.auth_user.get("role")) not in {
+        "admin", "manager", "warehouse", "sales", "customer"
+    }:
+        return jsonify({"status": "error", "message": "Vai trò không được xem workflow"}), 403
+    items, result = list_visible_workflow_requests()
+    if items is None:
+        return workflow_error_response(result, "Không thể lấy danh sách yêu cầu")
+    return jsonify({"status": "success", "data": items})
+
+
+@app.route("/api/workflow/pending-counts", methods=["GET"])
+@require_auth()
+def get_workflow_pending_counts():
+    items, result = list_visible_workflow_requests()
+    if items is None:
+        return workflow_error_response(result, "Không thể lấy số yêu cầu chờ xử lý")
+    pending_approval = sum(item.get("status") == "PENDING_APPROVAL" for item in items)
+    awaiting_customer = sum(item.get("status") == "AWAITING_CUSTOMER" for item in items)
+    role = normalize_role(request.auth_user.get("role"))
+    if role in {"admin", "manager"}:
+        total = pending_approval
+    elif role == "customer":
+        total = awaiting_customer
+    else:
+        # Makers track all of their own nonterminal requests.
+        total = pending_approval + awaiting_customer
+    return jsonify({"status": "success", "data": {
+        "pendingApproval": pending_approval,
+        "awaitingCustomer": awaiting_customer,
+        "total": total,
+    }})
+
+
+@app.route("/api/workflow/requests/<request_id>/<decision>", methods=["POST"])
+@require_auth()
+def decide_workflow_request(request_id, decision):
+    decision = str(decision).lower()
+    role = normalize_role(request.auth_user.get("role"))
+    if decision in {"approve", "reject"}:
+        if role not in {"manager", "admin"}:
+            return jsonify({"status": "error", "message": "Chỉ Manager/Admin được phê duyệt hoặc từ chối"}), 403
+        function = "ApproveWorkflowRequest" if decision == "approve" else "RejectWorkflowRequest"
+    elif decision in {"accept", "decline"}:
+        if role != "customer":
+            return jsonify({"status": "error", "message": "Chỉ khách hàng đích được chấp nhận hoặc từ chối"}), 403
+        function = "AcceptWorkflowRequest" if decision == "accept" else "DeclineWorkflowRequest"
+    else:
+        return jsonify({"status": "error", "message": "Quyết định không hợp lệ"}), 404
+    body = request.get_json(silent=True) or {}
+    result = invoke_chaincode(function, [
+        str(request_id), str(body.get("reason", "")),
+        str(request.auth_user.get("id", "")),
+    ])
+    if not result.get("success"):
+        return workflow_error_response(result, "Không thể cập nhật yêu cầu")
+    item = parse_chaincode_result(result)
+    return jsonify({
+        "status": "success", "message": "Đã cập nhật yêu cầu",
+        "data": item if isinstance(item, dict) else {},
+    })
+
+
 @app.route("/api/chaincode/invoke", methods=["POST"])
 @require_auth()
 def authenticated_chaincode_invoke():
@@ -2262,7 +2509,11 @@ def authenticated_chaincode_invoke():
         "GetPasswordHash", "SetUserPassword", "MigrateUserCredential", "TransferAsset",
         "TransferAssetQuantity", "UpdateAsset", "UpdateUser", "UsernameExists",
         "ReturnAssetToStore", "DeleteAssetQuantity", "RegisterUserIdentity",
-        "RotateUserIdentity", "BootstrapAdminIdentity", "GetUserIdentity"
+        "RotateUserIdentity", "BootstrapAdminIdentity", "GetUserIdentity",
+        "SubmitAssetCreationRequest", "SubmitInventoryTransferRequest",
+        "ApproveWorkflowRequest", "RejectWorkflowRequest",
+        "AcceptWorkflowRequest", "DeclineWorkflowRequest", "ReadWorkflowRequest",
+        "ListWorkflowRequests"
     }
     if not function or not isinstance(args, list):
         return jsonify({
@@ -2389,6 +2640,19 @@ def create_asset():
 
     body = request.get_json(silent=True) or {}
 
+    role = normalize_role(request.auth_user.get("role"))
+    if role == "warehouse":
+        item, error_response, status_code = submit_creation_workflow(body)
+        if item is None:
+            return error_response if status_code is None else (error_response, status_code)
+        return jsonify({
+            "status": "success",
+            "message": "Đã gửi yêu cầu tạo tài sản; tài sản chỉ xuất hiện sau khi được duyệt",
+            "data": item,
+        }), status_code
+    if role != "admin":
+        return jsonify({"status": "error", "message": "Tạo trực tiếp chỉ dành cho Admin"}), 403
+
     required_fields = [
         "id",
         "name",
@@ -2408,8 +2672,6 @@ def create_asset():
             }), 400
 
     owner_id = str(body.get("ownerID") or STORE_USER_ID)
-    if normalize_role(request.auth_user.get("role")) == "warehouse":
-        owner_id = ADMIN_OWNER_ID
 
     try:
         quantity = int(body["quantity"])
@@ -2629,16 +2891,14 @@ def transfer_asset(asset_id):
     elif role == "sales":
         if not has_permission(request.auth_user, "transfer_asset"):
             return jsonify({"status": "error", "message": "Không có quyền bán tài sản"}), 403
-        if str(asset.get("ownerID")) not in {STORE_USER_ID, ADMIN_OWNER_ID}:
-            return jsonify({"status": "error", "message": "Chỉ có thể bán tài sản chưa thuộc khách hàng"}), 403
-        recipient_result = invoke_chaincode("GetUser", [str(new_owner_id)])
-        recipient = parse_chaincode_result(recipient_result)
-        if (
-            not recipient_result.get("success")
-            or not isinstance(recipient, dict)
-            or normalize_role(recipient.get("role")) != "customer"
-        ):
-            return jsonify({"status": "error", "message": "Nhân viên bán hàng chỉ có thể bán cho khách hàng"}), 400
+        item, error_response, status_code = submit_transfer_workflow(body, asset_id, asset)
+        if item is None:
+            return error_response if status_code is None else (error_response, status_code)
+        return jsonify({
+            "status": "success",
+            "message": "Đã gửi yêu cầu chuyển tài sản; hàng đã được giữ chỗ",
+            "data": item,
+        }), status_code
     elif not has_permission(request.auth_user, "transfer_asset"):
         return jsonify({"status": "error", "message": "Không có quyền chuyển tài sản"}), 403
 

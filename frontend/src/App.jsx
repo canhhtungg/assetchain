@@ -178,6 +178,8 @@ function App() {
   const [permissionConfig, setPermissionConfig] = useState(null);
   const [passwordResetRequests, setPasswordResetRequests] = useState([]);
   const [fabricIdentityRequests, setFabricIdentityRequests] = useState([]);
+  const [workflowRequests, setWorkflowRequests] = useState([]);
+  const [workflowPendingCount, setWorkflowPendingCount] = useState(0);
   const [requestsLoading, setRequestsLoading] = useState(false);
   const [userTab, setUserTab] = useState("employees");
   const [editingUser, setEditingUser] = useState(null);
@@ -214,7 +216,8 @@ function App() {
   const pendingIdentityCount = fabricIdentityRequests.filter(
     (item) => item.status === "pending" || item.status === "failed"
   ).length;
-  const pendingRequestCount = pendingResetCount + pendingIdentityCount;
+  const systemPendingCount = pendingResetCount + pendingIdentityCount;
+  const pendingRequestCount = systemPendingCount + workflowPendingCount;
 
   useEffect(() => {
     try {
@@ -377,6 +380,7 @@ useEffect(() => {
             ),
 
             quantity: Number(asset.quantity || 1),
+            reservedQuantity: Number(asset.reservedQuantity || 0),
 
             updatedAt:
               asset.updatedAt ||
@@ -460,6 +464,22 @@ useEffect(() => {
     }
   };
 
+  const loadWorkflowRequests = async () => {
+    try {
+      setRequestsLoading(true);
+      const [requestData, countData] = await Promise.all([
+        apiRequest("/api/workflow/requests"),
+        apiRequest("/api/workflow/pending-counts"),
+      ]);
+      const items = Array.isArray(requestData.data) ? requestData.data : [];
+      setWorkflowRequests(items);
+      setWorkflowPendingCount(Number(countData.data?.total || 0));
+      return items;
+    } finally {
+      setRequestsLoading(false);
+    }
+  };
+
 
   /*
    * =====================================================
@@ -507,6 +527,7 @@ useEffect(() => {
         loadUsers(),
         isAdmin ? loadNetworks() : Promise.resolve(),
         loadPermissions(),
+        loadWorkflowRequests(),
         isAdmin ? loadAdminRequests() : Promise.resolve(),
       ]);
     } catch (error) {
@@ -1208,11 +1229,16 @@ useEffect(() => {
         });
       }
 
-      await loadAssets();
+      await Promise.all([
+        loadAssets(),
+        !isEdit && isWarehouse ? loadWorkflowRequests() : Promise.resolve(),
+      ]);
 
       setNotice(
         isEdit
           ? "Đã cập nhật tài sản trên Blockchain"
+          : isWarehouse
+          ? "Đã gửi yêu cầu tạo sản phẩm. Tài sản sẽ xuất hiện sau khi Manager/Admin phê duyệt."
           : "Đã thêm tài sản vào Blockchain"
       );
       if (page === "transactions") {
@@ -1264,7 +1290,14 @@ useEffect(() => {
       return;
     }
 
-    const availableQuantity = Number(asset?.quantity || 1);
+    const availableQuantity = Math.max(
+      0,
+      Number(asset?.quantity || 1) - Number(asset?.reservedQuantity || 0)
+    );
+    if (availableQuantity < 1) {
+      setNotice("Toàn bộ số lượng đang được giữ chỗ bởi yêu cầu chưa hoàn tất");
+      return;
+    }
     let quantity = availableQuantity;
     if (availableQuantity > 1) {
       const answer = window.prompt(
@@ -1299,26 +1332,21 @@ useEffect(() => {
 
     try {
       setLoading(true);
-      let ownerID = transfer.ownerID;
-      if (transfer.newCustomer) {
-        const customer = await createUserRecord({
-          ...transfer.newCustomer,
-          role: "customer",
-        });
-        ownerID = customer.id;
-        await loadUsers();
-      }
       await apiRequest(`/api/assets/${encodeURIComponent(selected.id)}/transfer`, {
         method: "POST",
         body: JSON.stringify({
-          newOwnerID: ownerID,
+          newOwnerID: transfer.ownerID,
           quantity: transfer.quantity,
           newAssetID: transfer.newAssetID,
         }),
       });
-      await loadAssets();
+      await Promise.all([loadAssets(), isSales ? loadWorkflowRequests() : Promise.resolve()]);
 
-      setNotice("Đã chuyển quyền sở hữu trên Blockchain");
+      setNotice(
+        isSales
+          ? "Đã gửi yêu cầu chuyển tài sản. Số lượng đã được giữ chỗ; quyền sở hữu chỉ đổi sau khi khách hàng chấp nhận."
+          : "Đã chuyển quyền sở hữu trên Blockchain"
+      );
       setModal(null);
       setSelected(null);
       setConfirmDialog(null);
@@ -1345,7 +1373,7 @@ useEffect(() => {
       return;
     }
 
-    if (ownerID !== "STORE" && !transfer?.newCustomer && !users.some((user) => user.id === ownerID)) {
+    if (ownerID !== "STORE" && !users.some((user) => user.id === ownerID)) {
       setNotice(`User ${ownerID} chưa tồn tại trên Blockchain`);
       return;
     }
@@ -1357,8 +1385,8 @@ useEffect(() => {
 
     setConfirmDialog({
       title: isCustomer ? "Xác nhận bán lại cho cửa hàng" : "Xác nhận chuyển quyền",
-      message: `Bạn có chắc chắn muốn chuyển tài sản “${selected.name}”?\n\nMã tài sản: ${selected.id}\nSố lượng: ${transfer.quantity || selected.quantity || 1}\n\nChủ sở hữu hiện tại:\n${selected.ownerID}\n\nChủ sở hữu mới:\n${recipientLabel}\n\nSau khi xác nhận, quyền sở hữu sẽ được ghi lên Blockchain.`,
-      confirmText: "Xác nhận chuyển",
+      message: `Bạn có chắc chắn muốn ${isSales ? "gửi yêu cầu chuyển" : "chuyển"} tài sản “${selected.name}”?\n\nMã tài sản: ${selected.id}\nSố lượng: ${transfer.quantity || selected.quantity || 1}\n\nChủ sở hữu hiện tại:\n${selected.ownerID}\n\nChủ sở hữu mới:\n${recipientLabel}\n\n${isSales ? "Số lượng sẽ được giữ chỗ ngay. Manager/Admin duyệt một lần, sau đó chính khách hàng phải chấp nhận thì quyền sở hữu mới thay đổi." : "Sau khi xác nhận, quyền sở hữu sẽ được ghi lên Blockchain."}`,
+      confirmText: isSales ? "Gửi yêu cầu" : "Xác nhận chuyển",
       danger: false,
       onConfirm: () => executeTransferAsset(transfer),
     });
@@ -1477,6 +1505,8 @@ useEffect(() => {
     setNetwork(null);
     setPasswordResetRequests([]);
     setFabricIdentityRequests([]);
+    setWorkflowRequests([]);
+    setWorkflowPendingCount(0);
     setSelected(null);
     setEditing(null);
     setModal(null);
@@ -2095,6 +2125,54 @@ useEffect(() => {
     });
   };
 
+  const reviewWorkflowRequest = (item, decision) => {
+    const destructive = decision === "reject" || decision === "decline";
+    const actionLabel = {
+      approve: "phê duyệt",
+      reject: "từ chối",
+      accept: "chấp nhận",
+      decline: "từ chối nhận",
+    }[decision];
+    let reason = "";
+    if (destructive) {
+      const entered = window.prompt("Lý do (không bắt buộc)", "");
+      if (entered === null) return;
+      reason = entered.trim();
+    }
+    const subjectText = item.type === "ASSET_CREATION"
+      ? `Tạo tài sản ${item.assetID} với số lượng ${item.quantity}.`
+      : `Chuyển ${item.quantity} sản phẩm từ ${item.assetID} cho ${item.targetCustomerID}.`;
+    const effectText = decision === "approve" && item.type === "INVENTORY_TRANSFER"
+      ? "Sau bước này, yêu cầu vẫn phải được chính khách hàng đích chấp nhận."
+      : decision === "accept"
+      ? "Quyền sở hữu và số lượng sẽ được cập nhật trên Blockchain."
+      : destructive
+      ? "Số lượng giữ chỗ (nếu có) sẽ được giải phóng."
+      : "";
+    setConfirmDialog({
+      title: `${actionLabel[0].toUpperCase()}${actionLabel.slice(1)} yêu cầu`,
+      message: `${actionLabel[0].toUpperCase()}${actionLabel.slice(1)} yêu cầu ${item.id}?\n\n${subjectText}\n\n${effectText}`,
+      confirmText: actionLabel,
+      danger: destructive,
+      onConfirm: async () => {
+        try {
+          setLoading(true);
+          const response = await apiRequest(
+            `/api/workflow/requests/${encodeURIComponent(item.id)}/${decision}`,
+            { method: "POST", body: JSON.stringify({ reason }) }
+          );
+          await Promise.all([loadWorkflowRequests(), loadAssets()]);
+          setNotice(response.message || "Đã cập nhật yêu cầu");
+          setConfirmDialog(null);
+        } catch (error) {
+          setNotice(error.message);
+        } finally {
+          setLoading(false);
+        }
+      },
+    });
+  };
+
   const renderRequests = () => {
     const identityStatusLabel = (status) => ({
       pending: "Chờ xử lý",
@@ -2103,18 +2181,105 @@ useEffect(() => {
       rejected: "Đã từ chối",
       failed: "Cấp thất bại",
     }[status] || status);
+    const workflowStatusLabel = (status) => ({
+      PENDING_APPROVAL: "Chờ phê duyệt",
+      AWAITING_CUSTOMER: "Chờ khách hàng",
+      COMPLETED: "Hoàn tất",
+      REJECTED: "Đã từ chối",
+      DECLINED: "Khách hàng từ chối",
+    }[status] || status);
     return (
       <>
         <div className="page-toolbar">
           <div>
-            <h2>Yêu cầu quản trị</h2>
-            <p>{pendingRequestCount} yêu cầu cần Admin xử lý</p>
+            <h2>Yêu cầu & phê duyệt</h2>
+            <p>{workflowPendingCount} yêu cầu workflow đang chờ · lịch sử hiển thị theo vai trò</p>
           </div>
-          <button className="secondary-button" onClick={loadAdminRequests} disabled={requestsLoading}>
+          <button
+            className="secondary-button"
+            onClick={() => Promise.all([loadWorkflowRequests(), isAdmin ? loadAdminRequests() : Promise.resolve()])}
+            disabled={requestsLoading}
+          >
             {requestsLoading ? "Đang tải..." : "↻ Làm mới"}
           </button>
         </div>
 
+        <h3>Workflow tài sản</h3>
+        <div className="table-card workflow-table" style={{ marginBottom: "28px" }}>
+          <table>
+            <thead>
+              <tr>
+                <th>YÊU CẦU</th>
+                <th>CHI TIẾT</th>
+                <th>NGƯỜI THỰC HIỆN</th>
+                <th>TRẠNG THÁI</th>
+                <th>XỬ LÝ</th>
+              </tr>
+            </thead>
+            <tbody>
+              {workflowRequests.length ? workflowRequests.map((item) => {
+                const canCheck = ["admin", "manager"].includes(currentRole)
+                  && item.status === "PENDING_APPROVAL"
+                  && item.makerID !== currentUser?.id;
+                const canCustomerAct = isCustomer
+                  && item.status === "AWAITING_CUSTOMER"
+                  && item.targetCustomerID === currentUser?.id;
+                return (
+                  <tr key={item.id}>
+                    <td>
+                      <strong>{item.type === "ASSET_CREATION" ? "Tạo tài sản" : "Chuyển kho"}</strong>
+                      <div className="muted">{item.id}</div>
+                      <div className="muted">{item.createdAt ? new Date(item.createdAt).toLocaleString("vi-VN") : "-"}</div>
+                    </td>
+                    <td>
+                      <strong>{item.assetID}</strong>
+                      {item.newAssetID && <div className="muted">Mã mới: {item.newAssetID}</div>}
+                      <div className="muted">Số lượng: {item.quantity}</div>
+                      {item.targetCustomerID && <div className="muted">Khách hàng: {item.targetCustomerID}</div>}
+                    </td>
+                    <td>
+                      <div>Maker: {item.makerID || "-"}</div>
+                      <div className="muted">Checker: {item.checkerID || "-"}</div>
+                      {item.customerActorID && <div className="muted">Khách hàng: {item.customerActorID}</div>}
+                    </td>
+                    <td>
+                      <span className={`request-status ${String(item.status || "").toLowerCase()}`}>
+                        {workflowStatusLabel(item.status)}
+                      </span>
+                      {item.reason && <div className="request-reason">{item.reason}</div>}
+                    </td>
+                    <td>
+                      {canCheck ? (
+                        <div className="request-actions">
+                          <button className="primary-button" onClick={() => reviewWorkflowRequest(item, "approve")} disabled={loading}>Phê duyệt</button>
+                          <button className="danger-button" onClick={() => reviewWorkflowRequest(item, "reject")} disabled={loading}>Từ chối</button>
+                        </div>
+                      ) : canCustomerAct ? (
+                        <div className="request-actions">
+                          <button className="primary-button" onClick={() => reviewWorkflowRequest(item, "accept")} disabled={loading}>Chấp nhận</button>
+                          <button className="danger-button" onClick={() => reviewWorkflowRequest(item, "decline")} disabled={loading}>Từ chối nhận</button>
+                        </div>
+                      ) : (
+                        <span className="muted">
+                          {item.makerID === currentUser?.id && item.status === "PENDING_APPROVAL"
+                            ? "Đang chờ checker"
+                            : item.status === "AWAITING_CUSTOMER"
+                            ? "Đang chờ khách hàng đích"
+                            : "Đã ghi lịch sử"}
+                        </span>
+                      )}
+                    </td>
+                  </tr>
+                );
+              }) : (
+                <tr><td colSpan="5" className="empty">Chưa có yêu cầu workflow phù hợp với vai trò của bạn</td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+
+        {isAdmin && <>
+        <h2 className="request-section-title">Yêu cầu hệ thống</h2>
         <h3>Cấp Fabric identity</h3>
         <div className="table-card" style={{ marginBottom: "28px" }}>
           <table>
@@ -2209,6 +2374,7 @@ useEffect(() => {
             </tbody>
           </table>
         </div>
+        </>}
       </>
     );
   };
@@ -2581,7 +2747,7 @@ useEffect(() => {
             ["assets", "package", "Tài sản"],
             ...(canAccessUsers ? [["users", "users", "Nhân sự & người dùng"]] : []),
             ...(can("view_history") ? [["transactions", "history", "Lịch sử giao dịch"]] : []),
-            ...(isAdmin ? [["requests", "mail", `Yêu cầu${pendingRequestCount ? ` (${pendingRequestCount})` : ""}`]] : []),
+            ...([["requests", "mail", `Yêu cầu${pendingRequestCount ? ` (${pendingRequestCount})` : ""}`]]),
             ...(isAdmin ? [["permissions", "shield-check", "Phân quyền"]] : []),
           ].map(
             ([
@@ -2767,7 +2933,7 @@ useEffect(() => {
           {page === "transactions" &&
             renderTransactions()}
 
-          {page === "requests" && isAdmin &&
+          {page === "requests" &&
             renderRequests()}
 
           {page === "permissions" && isAdmin &&
@@ -2912,6 +3078,11 @@ useEffect(() => {
                 <div>
                   <span>Số lượng</span>
                   <strong>{Number(selected.quantity || 1)}</strong>
+                </div>
+
+                <div>
+                  <span>Đang giữ chỗ</span>
+                  <strong>{Number(selected.reservedQuantity || 0)}</strong>
                 </div>
 
 
@@ -4319,33 +4490,25 @@ function TransferModal({
   );
   const [owner, setOwner] = useState(isCustomer ? "STORE" : "");
   const [quantity, setQuantity] = useState(1);
-  const [showNewCustomer, setShowNewCustomer] = useState(false);
-  const [customerForm, setCustomerForm] = useState({
-    id: "",
-    username: "",
-    password: "",
-    fullName: "",
-    contact: "",
-  });
+  const availableQuantity = Math.max(
+    0,
+    Number(asset?.quantity || 1) - Number(asset?.reservedQuantity || 0)
+  );
 
   const generateSaleAssetId = () =>
     `SALE-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
 
   const submit = (event) => {
     event.preventDefault();
-    let selectedOwner = owner;
-    if (isSales && showNewCustomer) {
-      selectedOwner = "NEW_CUSTOMER";
-    }
-    if (!selectedOwner) return;
+    if (!owner) return;
+    const transferQuantity = isCustomer ? Number(asset?.quantity || 1) : Number(quantity);
     onSave({
-      ownerID: selectedOwner,
-      quantity: isCustomer ? Number(asset?.quantity || 1) : Number(quantity),
-      newAssetID: generateSaleAssetId(),
-      newCustomer: isSales && showNewCustomer ? customerForm : null,
-      recipient: isSales && showNewCustomer
-        ? { ...customerForm, id: "Tự động", role: "CUSTOMER" }
-        : null,
+      ownerID: owner,
+      quantity: transferQuantity,
+      newAssetID: !isCustomer && transferQuantity < Number(asset?.quantity || 1)
+        ? generateSaleAssetId()
+        : "",
+      recipient: users.find((user) => user.id === owner),
     });
   };
 
@@ -4370,8 +4533,7 @@ function TransferModal({
             <label>
               {isSales ? "Khách hàng" : "Chủ sở hữu mới"}
               <select
-                required={!showNewCustomer}
-                disabled={showNewCustomer}
+                required
                 value={owner}
                 onChange={(event) => setOwner(event.target.value)}
               >
@@ -4392,31 +4554,17 @@ function TransferModal({
                 required
                 type="number"
                 min="1"
-                max={Number(asset?.quantity || 1)}
+                max={availableQuantity}
                 value={quantity}
                 onChange={(event) => setQuantity(event.target.value)}
               />
             </label>
 
             {isSales && (
-              <label style={{ display: "flex", gap: "8px", alignItems: "center" }}>
-                <input
-                  type="checkbox"
-                  checked={showNewCustomer}
-                  onChange={(event) => setShowNewCustomer(event.target.checked)}
-                />
-                Thêm khách hàng mới ngay khi bán
-              </label>
-            )}
-
-            {isSales && showNewCustomer && (
-              <div className="user-card">
-                <input placeholder="SĐT/email (để trống sẽ dùng user_STT)" value={customerForm.contact} onChange={(event) => setCustomerForm({ ...customerForm, contact: event.target.value })} />
-                <input required placeholder="Username" value={customerForm.username} onChange={(event) => setCustomerForm({ ...customerForm, username: event.target.value })} />
-                <input required placeholder="Họ và tên" value={customerForm.fullName} onChange={(event) => setCustomerForm({ ...customerForm, fullName: event.target.value })} />
-                <div className="default-password-note">
-                  Mật khẩu ban đầu: <strong>12345678</strong>; khách hàng phải đổi khi đăng nhập lần đầu.
-                </div>
+              <div className="workflow-hint">
+                Chỉ khách hàng hiện có được chọn. {Number(asset?.reservedQuantity || 0) > 0
+                  ? `${asset.reservedQuantity} sản phẩm đang được giữ chỗ; còn ${availableQuantity}.`
+                  : "Số lượng sẽ được giữ chỗ ngay khi gửi yêu cầu."}
               </div>
             )}
           </>
@@ -4424,8 +4572,8 @@ function TransferModal({
 
         <div className="modal-actions">
           <button type="button" className="secondary-button" onClick={onClose}>Hủy</button>
-          <button className="primary-button" disabled={!isCustomer && !showNewCustomer && !owner}>
-            {isCustomer ? "Xác nhận bán lại" : "Xác nhận bán/chuyển"}
+          <button className="primary-button" disabled={!isCustomer && (!owner || availableQuantity < 1)}>
+            {isCustomer ? "Xác nhận bán lại" : isSales ? "Gửi yêu cầu chuyển" : "Xác nhận chuyển"}
           </button>
         </div>
       </form>
