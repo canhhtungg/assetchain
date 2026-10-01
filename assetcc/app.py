@@ -1427,6 +1427,18 @@ def can_view_asset(identity, asset):
     return False
 
 
+def asset_with_available_quantity(asset):
+    """Add the derived sellable quantity without changing ledger fields."""
+    result = dict(asset)
+    try:
+        quantity = int(result.get("quantity") or 1)
+        reserved = int(result.get("reservedQuantity") or 0)
+    except (TypeError, ValueError):
+        quantity, reserved = 0, 0
+    result["availableQuantity"] = max(0, quantity - reserved)
+    return result
+
+
 def customer_ids_sold_by(identity):
     if normalize_role(identity.get("role")) != "sales":
         return set()
@@ -1574,7 +1586,10 @@ def submit_creation_workflow(body):
     request_id = workflow_request_id("creation")
     if request_id is None:
         return None, jsonify({"status": "error", "message": "Idempotency-Key không hợp lệ"}), 400
-    owner_id = str(body.get("ownerID") or STORE_USER_ID)
+    # Warehouse-created inventory always belongs to the system store. Keep
+    # U001 support in chaincode for legacy records, but never accept it from
+    # this workflow route.
+    owner_id = STORE_USER_ID
     args = [
         request_id, str(body["id"]), str(body["name"]), str(body["type"]),
         owner_id, str(value), str(body["status"]),
@@ -1616,6 +1631,15 @@ def submit_transfer_workflow(body, asset_id=None, existing_asset=None):
         return None, jsonify({"status": "error", "message": "Số lượng bán không hợp lệ"}), 400
     if quantity < 1:
         return None, jsonify({"status": "error", "message": "Số lượng bán phải lớn hơn 0"}), 400
+    available_quantity = max(
+        0,
+        int(asset.get("quantity") or 1) - int(asset.get("reservedQuantity") or 0),
+    )
+    if quantity > available_quantity:
+        return None, jsonify({
+            "status": "error",
+            "message": f"Chỉ còn {available_quantity} sản phẩm khả dụng; phần còn lại đang được giữ chỗ",
+        }), 409
     new_asset_id = str(body.get("newAssetID") or "").strip()
     if quantity < int(asset.get("quantity") or 1) and not new_asset_id:
         return None, jsonify({"status": "error", "message": "Thiếu mã tài sản mới khi bán một phần"}), 400
@@ -2484,6 +2508,23 @@ def decide_workflow_request(request_id, decision):
     else:
         return jsonify({"status": "error", "message": "Quyết định không hợp lệ"}), 404
     body = request.get_json(silent=True) or {}
+    if decision == "approve":
+        request_result = invoke_chaincode("ReadWorkflowRequest", [str(request_id)])
+        workflow_item = parse_chaincode_result(request_result)
+        if not request_result.get("success") or not isinstance(workflow_item, dict):
+            return workflow_error_response(
+                request_result, "Không thể kiểm tra yêu cầu trước khi phê duyệt"
+            )
+        if workflow_item.get("type") == "INVENTORY_TRANSFER":
+            target_customer_id = str(workflow_item.get("targetCustomerID") or "").strip()
+            if not target_customer_id or identity_binding(target_customer_id) is None:
+                return jsonify({
+                    "status": "error",
+                    "message": (
+                        "Không thể phê duyệt chuyển tài sản: khách hàng đích chưa có "
+                        "Fabric identity đang hoạt động. Vui lòng cấp identity trước."
+                    ),
+                }), 409
     result = invoke_chaincode(function, [
         str(request_id), str(body.get("reason", "")),
         str(request.auth_user.get("id", "")),
@@ -2591,7 +2632,11 @@ def get_assets():
     assets = parse_chaincode_result(result)
     if not isinstance(assets, list):
         assets = []
-    assets = [asset for asset in assets if can_view_asset(request.auth_user, asset)]
+    assets = [
+        asset_with_available_quantity(asset)
+        for asset in assets
+        if can_view_asset(request.auth_user, asset)
+    ]
 
     return jsonify({
         "status": "success",
@@ -2626,7 +2671,7 @@ def get_asset(asset_id):
 
     return jsonify({
         "status": "success",
-        "data": asset
+        "data": asset_with_available_quantity(asset)
     })
 
 
@@ -2819,7 +2864,10 @@ def delete_asset(asset_id):
         quantity = int(body.get("quantity") or asset.get("quantity") or 1)
     except (TypeError, ValueError):
         return jsonify({"status": "error", "message": "Số lượng xóa không hợp lệ"}), 400
-    available_quantity = int(asset.get("quantity") or 1)
+    available_quantity = max(
+        0,
+        int(asset.get("quantity") or 1) - int(asset.get("reservedQuantity") or 0),
+    )
     if quantity < 1 or quantity > available_quantity:
         return jsonify({
             "status": "error",

@@ -901,6 +901,10 @@ class AuthenticationApiTest(unittest.TestCase):
             response.get_json()["data"],
             {"id": "user_3", "fullName": "New Customer", "role": "CUSTOMER"},
         )
+        identity_request = response.get_json()["identityRequest"]
+        self.assertEqual(identity_request["user_id"], "user_3")
+        self.assertEqual(identity_request["requested_by"], "S001")
+        self.assertEqual(identity_request["status"], "pending")
 
     @patch("app.invoke_chaincode")
     def test_customer_can_only_update_own_contact(self, invoke):
@@ -1054,7 +1058,7 @@ class AuthenticationApiTest(unittest.TestCase):
             "/api/assets",
             json={
                 "id": "SKU-W1", "name": "Phone", "type": "Electronics",
-                "value": 1000, "quantity": 5, "status": "Active",
+                "ownerID": "U001", "value": 1000, "quantity": 5, "status": "Active",
             },
             headers={
                 "Authorization": f"Bearer {token}",
@@ -1066,6 +1070,7 @@ class AuthenticationApiTest(unittest.TestCase):
         function, args = invoke.call_args.args
         self.assertEqual(function, "SubmitAssetCreationRequest")
         self.assertEqual(args[1], "SKU-W1")
+        self.assertEqual(args[4], "STORE")
         self.assertEqual(args[-1], "W001")
         self.assertNotIn("CreateAsset", [call.args[0] for call in invoke.call_args_list])
         self.assertNotIn("password", json.dumps(args).lower())
@@ -1121,6 +1126,67 @@ class AuthenticationApiTest(unittest.TestCase):
         self.assertNotIn("TransferAssetQuantity", functions)
 
     @patch("app.invoke_chaincode")
+    def test_asset_response_derives_available_quantity(self, invoke):
+        invoke.return_value = {"success": True, "data": {"result": [{
+            "id": "SKU-RSV", "ownerID": "STORE", "quantity": 7,
+            "reservedQuantity": 3,
+        }]}}
+        token = backend.auth_serializer().dumps({"id": "M001", "role": "MANAGER"})
+        response = self.client.get(
+            "/api/assets", headers={"Authorization": f"Bearer {token}"}
+        )
+        self.assertEqual(response.status_code, 200)
+        asset = response.get_json()["data"][0]
+        self.assertEqual(asset["quantity"], 7)
+        self.assertEqual(asset["reservedQuantity"], 3)
+        self.assertEqual(asset["availableQuantity"], 4)
+
+    @patch("app.invoke_chaincode")
+    def test_sales_transfer_rejects_quantity_that_is_fully_reserved(self, invoke):
+        invoke.side_effect = [
+            {"success": True, "data": {"result": {
+                "id": "SKU-FULL", "ownerID": "STORE", "quantity": 5,
+                "reservedQuantity": 5,
+            }}},
+            {"success": True, "data": {"result": {
+                "id": "C001", "role": "CUSTOMER",
+            }}},
+        ]
+        token = backend.auth_serializer().dumps({"id": "S001", "role": "SALES"})
+        response = self.client.post(
+            "/api/assets/SKU-FULL/transfer",
+            json={"newOwnerID": "C001", "quantity": 1, "newAssetID": "SALE-FULL"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("0 sản phẩm khả dụng", response.get_json()["message"])
+        self.assertEqual(
+            [call.args[0] for call in invoke.call_args_list],
+            ["ReadAsset", "GetUser"],
+        )
+
+    @patch("app.invoke_chaincode")
+    def test_transfer_approval_requires_active_customer_identity_binding(self, invoke):
+        backend.save_identity_binding({
+            "user_id": "C-NO-ID", "key_id": "pending-key",
+            "organization_id": "12", "msp_id": "Org1MSP",
+            "certificate_fingerprint": "b" * 64,
+            "key_name": "assetchain-C-NO-ID", "status": "pending",
+        })
+        invoke.return_value = {"success": True, "data": {"result": {
+            "id": "T-NO-ID", "type": "INVENTORY_TRANSFER",
+            "targetCustomerID": "C-NO-ID", "status": "PENDING_APPROVAL",
+        }}}
+        token = backend.auth_serializer().dumps({"id": "M001", "role": "MANAGER"})
+        response = self.client.post(
+            "/api/workflow/requests/T-NO-ID/approve",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("chưa có Fabric identity đang hoạt động", response.get_json()["message"])
+        invoke.assert_called_once_with("ReadWorkflowRequest", ["T-NO-ID"])
+
+    @patch("app.invoke_chaincode")
     def test_workflow_request_list_has_strict_role_filtering(self, invoke):
         items = [
             {"id": "C1", "makerID": "W001", "type": "ASSET_CREATION", "status": "PENDING_APPROVAL"},
@@ -1150,10 +1216,25 @@ class AuthenticationApiTest(unittest.TestCase):
 
     @patch("app.invoke_chaincode")
     def test_workflow_decisions_enforce_route_roles_and_actor(self, invoke):
-        invoke.return_value = {
-            "success": True,
-            "data": {"result": {"id": "T1", "status": "AWAITING_CUSTOMER"}},
-        }
+        backend.save_identity_binding({
+            "user_id": "C001", "key_id": "customer-key-1",
+            "organization_id": "12", "msp_id": "Org1MSP",
+            "certificate_fingerprint": "a" * 64,
+            "key_name": "assetchain-C001", "status": "active",
+        })
+        invoke.side_effect = [
+            {
+                "success": True,
+                "data": {"result": {
+                    "id": "T1", "type": "INVENTORY_TRANSFER",
+                    "targetCustomerID": "C001", "status": "PENDING_APPROVAL",
+                }},
+            },
+            {
+                "success": True,
+                "data": {"result": {"id": "T1", "status": "AWAITING_CUSTOMER"}},
+            },
+        ]
         sales_token = backend.auth_serializer().dumps({"id": "S001", "role": "SALES"})
         denied = self.client.post(
             "/api/workflow/requests/T1/approve",
@@ -1169,11 +1250,18 @@ class AuthenticationApiTest(unittest.TestCase):
             headers={"Authorization": f"Bearer {manager_token}"},
         )
         self.assertEqual(approved.status_code, 200)
-        invoke.assert_called_once_with(
-            "ApproveWorkflowRequest", ["T1", "verified", "M001"]
+        self.assertEqual(invoke.call_args_list[0].args, ("ReadWorkflowRequest", ["T1"]))
+        self.assertEqual(
+            invoke.call_args_list[1].args,
+            ("ApproveWorkflowRequest", ["T1", "verified", "M001"]),
         )
 
         invoke.reset_mock()
+        invoke.side_effect = None
+        invoke.return_value = {
+            "success": True,
+            "data": {"result": {"id": "T1", "status": "COMPLETED"}},
+        }
         customer_token = backend.auth_serializer().dumps({"id": "C001", "role": "CUSTOMER"})
         accepted = self.client.post(
             "/api/workflow/requests/T1/accept",

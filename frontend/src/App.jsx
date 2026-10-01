@@ -78,6 +78,17 @@ const isSoldAsset = (asset) => {
   return status === "sold" || !["STORE", ADMIN_OWNER_ID].includes(ownerID);
 };
 
+const availableQuantityOf = (asset) => Math.max(
+  0,
+  Number(asset?.availableQuantity ?? asset?.quantity ?? 1) -
+    (asset?.availableQuantity === undefined ? Number(asset?.reservedQuantity || 0) : 0)
+);
+
+const assetStatusLabel = (asset, role) =>
+  normalizeRole(role) === "customer" && isSoldAsset(asset)
+    ? "Đang sở hữu"
+    : asset?.status;
+
 function parseChaincodeResult(data, fallback = []) {
   let result =
     data?.result?.result ??
@@ -381,6 +392,11 @@ useEffect(() => {
 
             quantity: Number(asset.quantity || 1),
             reservedQuantity: Number(asset.reservedQuantity || 0),
+            availableQuantity: Math.max(
+              0,
+              Number(asset.availableQuantity ?? asset.quantity ?? 1) -
+                (asset.availableQuantity === undefined ? Number(asset.reservedQuantity || 0) : 0)
+            ),
 
             updatedAt:
               asset.updatedAt ||
@@ -626,7 +642,7 @@ useEffect(() => {
     ["STORE", ADMIN_OWNER_ID].includes(asset.ownerID)
   );
   const inventoryQuantity = inventoryAssets.reduce(
-    (total, asset) => total + Number(asset.quantity || 1),
+    (total, asset) => total + availableQuantityOf(asset),
     0
   );
   const employees = users.filter((user) => {
@@ -634,14 +650,11 @@ useEffect(() => {
     return ["manager", "sales", "warehouse"].includes(role) || (isAdmin && role === "admin");
   });
   const customers = users.filter((user) => normalizeRole(user.role) === "customer");
-  const canAccessUsers = [
-    "view_users",
-    "view_customers",
-    "create_staff",
-    "create_customer",
-    "update_user",
-    "update_own_contact",
-  ].some(can);
+  const canAccessUsers = isAdmin || (
+    isManager && ["view_users", "create_staff", "update_user"].some(can)
+  ) || (
+    isSales && ["view_customers", "create_customer"].some(can)
+  );
   const creatableRoles = isAdmin
     ? ["manager", "sales", "warehouse", "customer", "admin"]
     : isManager
@@ -971,6 +984,18 @@ useEffect(() => {
     }
   };
 
+  const createCustomerDuringSale = async (form) => {
+    if (!isSales || !can("create_customer")) {
+      throw new Error("Bạn không có quyền tạo khách hàng");
+    }
+    const response = await createUserRecord({ ...form, role: "customer" });
+    await loadUsers();
+    return {
+      customer: response.data,
+      message: response.message,
+    };
+  };
+
   const updateUser = async (form) => {
     if (!editingUser) return;
     const body = {};
@@ -1097,7 +1122,7 @@ useEffect(() => {
       : isEdit
       ? form.ownerID?.trim() || ""
       : isWarehouse
-      ? ADMIN_OWNER_ID
+      ? "STORE"
       : currentUser?.id || "";
     const value = parseAssetValue(form.value);
     const quantity = Number(form.quantity);
@@ -1178,7 +1203,7 @@ useEffect(() => {
       : isEdit
       ? form.ownerID?.trim()
       : isWarehouse
-      ? ADMIN_OWNER_ID
+      ? "STORE"
       : currentUser?.id;
 
     const asset = {
@@ -1329,6 +1354,10 @@ useEffect(() => {
 
   const executeTransferAsset = async (transfer) => {
     if (!selected) return;
+    if (isSales && availableQuantityOf(selected) < Number(transfer.quantity || 0)) {
+      setNotice("Số lượng khả dụng đã thay đổi. Vui lòng tải lại và chọn lại sản phẩm.");
+      return;
+    }
 
     try {
       setLoading(true);
@@ -1371,6 +1400,15 @@ useEffect(() => {
     if (!ownerID || ownerID === selected.ownerID) {
       setNotice("Vui lòng chọn User ID mới khác chủ sở hữu hiện tại");
       return;
+    }
+
+    if (isSales) {
+      const transferQuantity = Number(transfer?.quantity || 0);
+      const availableQuantity = availableQuantityOf(selected);
+      if (!Number.isSafeInteger(transferQuantity) || transferQuantity < 1 || transferQuantity > availableQuantity) {
+        setNotice(`Số lượng bán phải từ 1 đến ${availableQuantity}`);
+        return;
+      }
     }
 
     if (ownerID !== "STORE" && !users.some((user) => user.id === ownerID)) {
@@ -1669,6 +1707,8 @@ useEffect(() => {
 
         <AssetTable
           assets={visibleAssets.slice(0, 6)}
+          currentRole={currentRole}
+          disableUnavailable={isSales}
           onSelect={(asset) => {
             setSelected(asset);
 
@@ -1693,11 +1733,6 @@ useEffect(() => {
             <h2>
               Quản lý tài sản
             </h2>
-
-            <p>
-              Dữ liệu được lưu trên
-              Hyperledger Fabric Blockchain
-            </p>
           </div>
 
           <div
@@ -1747,6 +1782,8 @@ useEffect(() => {
 
         <AssetTable
           assets={filteredAssets}
+          currentRole={currentRole}
+          disableUnavailable={isSales}
           onSelect={setSelected}
         />
       </>
@@ -1781,11 +1818,6 @@ useEffect(() => {
             <h2>
               Người dùng
             </h2>
-
-            <p>
-              Danh sách người dùng
-              được lưu trên Blockchain
-            </p>
           </div>
 
           {creatableRoles.length > 0 && (
@@ -1954,9 +1986,6 @@ useEffect(() => {
       <div className="page-toolbar">
         <div>
           <h2>Lịch sử giao dịch</h2>
-          <p>
-            Lịch sử được truy xuất trực tiếp từ Blockchain thông qua GetAssetHistory
-          </p>
         </div>
 
         <button
@@ -2193,7 +2222,6 @@ useEffect(() => {
         <div className="page-toolbar">
           <div>
             <h2>Yêu cầu & phê duyệt</h2>
-            <p>{workflowPendingCount} yêu cầu workflow đang chờ · lịch sử hiển thị theo vai trò</p>
           </div>
           <button
             className="secondary-button"
@@ -2489,31 +2517,33 @@ useEffect(() => {
       </div>
 
       <div className="settings-card">
-        {isAdmin ? (
+        <Setting label="Tài khoản hiện tại" value={currentUser?.username || "-"} />
+        <Setting label="Họ và tên" value={currentUser?.fullName || "-"} />
+        <div className="setting-row">
+          <div>
+            <strong>SĐT/email</strong>
+            <div className="muted" style={{ marginTop: "4px" }}>
+              {currentUser?.contact || "Chưa cập nhật"}
+            </div>
+          </div>
+          <span>{ROLE_LABELS[currentRole] || currentUser?.role}</span>
+          <button
+            className="secondary-button"
+            onClick={() => {
+              setEditingUser({ ...currentUser, canEdit: true });
+              setModal("user");
+            }}
+          >
+            Sửa SĐT/email
+          </button>
+        </div>
+
+        {isAdmin && (
           <>
             <Setting label="Blockchain" value="Hyperledger Fabric" status={backend} />
             <Setting label="Kết nối ChainLaunch" value="Thông qua Backend API" />
             <Setting label="Backend API" value={API_URL} />
-            <Setting label="Tài khoản hiện tại" value={currentUser?.username || "-"} />
           </>
-        ) : (
-          <div className="setting-row">
-            <div>
-              <strong>SĐT/email</strong>
-              <div className="muted" style={{ marginTop: "4px" }}>
-                {currentUser?.contact || "Chưa cập nhật"}
-              </div>
-            </div>
-            <button
-              className="secondary-button"
-              onClick={() => {
-                setEditingUser({ ...currentUser, canEdit: true });
-                setModal("user");
-              }}
-            >
-              Sửa SĐT/email
-            </button>
-          </div>
         )}
 
         <div className="setting-row">
@@ -2887,7 +2917,12 @@ useEffect(() => {
           </div>
 
 
-          <div className="user-profile">
+          <button
+            type="button"
+            className="user-profile"
+            onClick={() => setPage("settings")}
+            aria-label="Mở cài đặt hồ sơ"
+          >
 
             <div className="avatar">
               {(currentUser?.fullName || currentUser?.username || "U")
@@ -2907,7 +2942,7 @@ useEffect(() => {
 
             </div>
 
-          </div>
+          </button>
 
         </header>
 
@@ -2973,7 +3008,7 @@ useEffect(() => {
         <UserModal
           roles={creatableRoles}
           initial={editingUser}
-          contactOnly={!isAdmin && editingUser?.id === currentUser?.id}
+          contactOnly={editingUser?.id === currentUser?.id}
           allowRoleEdit={isAdmin}
           onResetPassword={isAdmin && editingUser?.id !== currentUser?.id ? requestAdminResetPassword : null}
           onClose={() => {
@@ -2994,6 +3029,7 @@ useEffect(() => {
             setModal(null)
           }
           onSave={transferAsset}
+          onCreateCustomer={isSales ? createCustomerDuringSale : null}
         />
       )}
 
@@ -3076,13 +3112,18 @@ useEffect(() => {
                 </div>
 
                 <div>
-                  <span>Số lượng</span>
+                  <span>Tổng số lượng</span>
                   <strong>{Number(selected.quantity || 1)}</strong>
                 </div>
 
                 <div>
                   <span>Đang giữ chỗ</span>
                   <strong>{Number(selected.reservedQuantity || 0)}</strong>
+                </div>
+
+                <div>
+                  <span>Khả dụng</span>
+                  <strong>{availableQuantityOf(selected)}</strong>
                 </div>
 
 
@@ -3127,9 +3168,7 @@ useEffect(() => {
                         ""
                       }`}
                     >
-                      {
-                        selected.status
-                      }
+                      {assetStatusLabel(selected, currentRole)}
                     </span>
                   </strong>
                 </div>
@@ -3144,6 +3183,8 @@ useEffect(() => {
                   (can("sell_back") && selected.ownerID === currentUser?.id)) && (
                   <button
                     className="primary-button"
+                    disabled={isSales && availableQuantityOf(selected) === 0}
+                    title={isSales && availableQuantityOf(selected) === 0 ? "Toàn bộ số lượng đang được giữ chỗ" : undefined}
                     onClick={() => setModal("transfer")}
                   >
                     {isCustomer ? "Bán lại cho cửa hàng" : isSales ? "Bán sản phẩm" : "Chuyển quyền"}
@@ -3225,10 +3266,12 @@ function ConfirmModal({ dialog, onClose }) {
         onClick={(event) => event.stopPropagation()}
         style={{
           width: "min(560px, 100%)",
-          background: "#fff",
+          background: "var(--panel-solid)",
+          color: "var(--text)",
+          border: "1px solid var(--line-strong)",
           borderRadius: "18px",
           padding: "30px",
-          boxShadow: "0 25px 80px rgba(0,0,0,.28)",
+          boxShadow: "var(--shadow)",
         }}
       >
         <div
@@ -3256,7 +3299,7 @@ function ConfirmModal({ dialog, onClose }) {
             margin: 0,
             whiteSpace: "pre-line",
             lineHeight: 1.65,
-            color: "#64748b",
+            color: "var(--muted)",
           }}
         >
           {dialog.message}
@@ -3334,9 +3377,11 @@ function NoticeModal({ message, onClose }) {
           position: "relative",
           width: "min(620px, 100%)",
           minHeight: "390px",
-          background: "#fff",
+          background: "var(--panel-solid)",
+          color: "var(--text)",
+          border: "1px solid var(--line-strong)",
           borderRadius: "16px",
-          boxShadow: "0 24px 70px rgba(0,0,0,.25)",
+          boxShadow: "var(--shadow)",
           display: "flex",
           flexDirection: "column",
           alignItems: "center",
@@ -3358,8 +3403,8 @@ function NoticeModal({ message, onClose }) {
             height: "38px",
             border: "none",
             borderRadius: "50%",
-            background: "#f3f4f6",
-            color: "#6b7280",
+            background: "var(--panel-raised)",
+            color: "var(--muted)",
             fontSize: "25px",
             lineHeight: 1,
             cursor: "pointer",
@@ -3405,7 +3450,7 @@ function NoticeModal({ message, onClose }) {
             margin: "0 0 14px",
             fontSize: "34px",
             lineHeight: 1.2,
-            color: "#4b4b4b",
+            color: "var(--text)",
             fontWeight: 600,
           }}
         >
@@ -3418,7 +3463,7 @@ function NoticeModal({ message, onClose }) {
             maxWidth: "520px",
             fontSize: "20px",
             lineHeight: 1.55,
-            color: "#666",
+            color: "var(--muted)",
           }}
         >
           {message}
@@ -3704,6 +3749,8 @@ function Setting({
 
 function AssetTable({
   assets,
+  currentRole,
+  disableUnavailable = false,
   onSelect,
 }) {
   return (
@@ -3732,7 +3779,7 @@ function AssetTable({
             </th>
 
             <th>
-              SỐ LƯỢNG
+              KHẢ DỤNG / TỔNG
             </th>
 
             <th>
@@ -3750,13 +3797,17 @@ function AssetTable({
 
           {assets.length ? (
             assets.map(
-              (asset) => (
+              (asset) => {
+                const unavailable = availableQuantityOf(asset) === 0;
+                const disabled = disableUnavailable && unavailable;
+                return (
                 <tr
                   key={asset.id}
-                  className="clickable"
-                  onClick={() =>
-                    onSelect(asset)
-                  }
+                  className={`clickable${unavailable ? " asset-unavailable" : ""}`}
+                  aria-disabled={disabled || undefined}
+                  onClick={() => {
+                    if (!disabled) onSelect(asset);
+                  }}
                 >
 
                   <td>
@@ -3812,7 +3863,14 @@ function AssetTable({
                     )}
                   </td>
 
-                  <td>{Number(asset.quantity || 1)}</td>
+                  <td>
+                    {availableQuantityOf(asset)} / {Number(asset.quantity || 1)}
+                    {Number(asset.reservedQuantity || 0) > 0 && (
+                      <small className="reserved-note">
+                        {asset.reservedQuantity} giữ chỗ
+                      </small>
+                    )}
+                  </td>
 
 
                   <td>
@@ -3824,9 +3882,7 @@ function AssetTable({
                         ""
                       }`}
                     >
-                      {
-                        asset.status
-                      }
+                      {assetStatusLabel(asset, currentRole)}
                     </span>
 
                   </td>
@@ -3837,7 +3893,8 @@ function AssetTable({
                   </td>
 
                 </tr>
-              )
+                );
+              }
             )
           ) : (
             <tr>
@@ -3888,7 +3945,7 @@ function AssetModal({
       id: generateAssetId(),
       name: "",
       type: "Computer",
-      ownerID: currentUser?.id || "",
+      ownerID: isWarehouse ? "STORE" : currentUser?.id || "",
       value: "",
       quantity: 1,
       status: "Active",
@@ -4155,7 +4212,7 @@ function AssetModal({
             <input
               value={
                 isWarehouse
-                  ? `Admin (${ADMIN_OWNER_ID})`
+                  ? "Kho cửa hàng (STORE)"
                   : currentUser
                   ? `${currentUser.fullName || currentUser.username} (${currentUser.id})`
                   : form.ownerID
@@ -4174,7 +4231,7 @@ function AssetModal({
               }}
             >
               {isWarehouse
-                ? "Sản phẩm mới được ghi dưới tên Admin."
+                ? "Sản phẩm mới luôn thuộc kho cửa hàng (STORE)."
                 : "Chủ sở hữu được khóa theo tài khoản đang đăng nhập."}
             </small>
           )}
@@ -4481,6 +4538,7 @@ function TransferModal({
   currentRole,
   onClose,
   onSave,
+  onCreateCustomer,
 }) {
   const isSales = currentRole === "sales";
   const isCustomer = currentRole === "customer";
@@ -4490,13 +4548,38 @@ function TransferModal({
   );
   const [owner, setOwner] = useState(isCustomer ? "STORE" : "");
   const [quantity, setQuantity] = useState(1);
-  const availableQuantity = Math.max(
-    0,
-    Number(asset?.quantity || 1) - Number(asset?.reservedQuantity || 0)
-  );
+  const [showCustomerForm, setShowCustomerForm] = useState(false);
+  const [creatingCustomer, setCreatingCustomer] = useState(false);
+  const [customerMessage, setCustomerMessage] = useState("");
+  const [customerForm, setCustomerForm] = useState({
+    username: "",
+    fullName: "",
+    contact: "",
+  });
+  const availableQuantity = availableQuantityOf(asset);
 
   const generateSaleAssetId = () =>
     `SALE-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
+
+  const createCustomer = async () => {
+    if (!onCreateCustomer) return;
+    if (!customerForm.username.trim() || !customerForm.fullName.trim()) {
+      setCustomerMessage("Vui lòng nhập username và họ tên khách hàng.");
+      return;
+    }
+    try {
+      setCreatingCustomer(true);
+      setCustomerMessage("");
+      const result = await onCreateCustomer(customerForm);
+      setOwner(result.customer?.id || "");
+      setCustomerMessage(result.message || "Đã tạo khách hàng và gửi yêu cầu cấp Fabric identity.");
+      setShowCustomerForm(false);
+    } catch (error) {
+      setCustomerMessage(error.message || "Không thể tạo khách hàng.");
+    } finally {
+      setCreatingCustomer(false);
+    }
+  };
 
   const submit = (event) => {
     event.preventDefault();
@@ -4516,7 +4599,9 @@ function TransferModal({
     <div className="modal-backdrop">
       <form className="modal" onSubmit={submit}>
         <h2>{isCustomer ? "Bán lại cho cửa hàng" : "Bán / chuyển quyền sở hữu"}</h2>
-        <p className="muted">{asset?.name} ({asset?.id}) · Có {Number(asset?.quantity || 1)} sản phẩm</p>
+        <p className="muted">
+          {asset?.name} ({asset?.id}) · Khả dụng {availableQuantity}/{Number(asset?.quantity || 1)} sản phẩm
+        </p>
 
         <label>
           Chủ sở hữu hiện tại
@@ -4548,6 +4633,55 @@ function TransferModal({
               </select>
             </label>
 
+            {isSales && onCreateCustomer && (
+              <div className="quick-customer">
+                <button
+                  type="button"
+                  className="secondary-button"
+                  onClick={() => {
+                    setShowCustomerForm((visible) => !visible);
+                    setCustomerMessage("");
+                  }}
+                >
+                  ＋ Tạo khách hàng mới trong đơn bán
+                </button>
+                {showCustomerForm && (
+                  <div className="quick-customer-fields">
+                    <label>
+                      Username
+                      <input
+                        value={customerForm.username}
+                        onChange={(event) => setCustomerForm({ ...customerForm, username: event.target.value })}
+                      />
+                    </label>
+                    <label>
+                      Họ và tên
+                      <input
+                        value={customerForm.fullName}
+                        onChange={(event) => setCustomerForm({ ...customerForm, fullName: event.target.value })}
+                      />
+                    </label>
+                    <label>
+                      SĐT/email
+                      <input
+                        value={customerForm.contact}
+                        onChange={(event) => setCustomerForm({ ...customerForm, contact: event.target.value })}
+                      />
+                    </label>
+                    <button
+                      type="button"
+                      className="primary-button"
+                      disabled={creatingCustomer}
+                      onClick={createCustomer}
+                    >
+                      {creatingCustomer ? "Đang tạo..." : "Tạo và chọn khách hàng"}
+                    </button>
+                  </div>
+                )}
+                {customerMessage && <div className="workflow-hint">{customerMessage}</div>}
+              </div>
+            )}
+
             <label>
               Số lượng bán/chuyển
               <input
@@ -4562,7 +4696,7 @@ function TransferModal({
 
             {isSales && (
               <div className="workflow-hint">
-                Chỉ khách hàng hiện có được chọn. {Number(asset?.reservedQuantity || 0) > 0
+                Có thể chọn hoặc tạo khách hàng ngay trong đơn bán. {Number(asset?.reservedQuantity || 0) > 0
                   ? `${asset.reservedQuantity} sản phẩm đang được giữ chỗ; còn ${availableQuantity}.`
                   : "Số lượng sẽ được giữ chỗ ngay khi gửi yêu cầu."}
               </div>

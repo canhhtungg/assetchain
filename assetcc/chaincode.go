@@ -1072,6 +1072,13 @@ func (s *SmartContract) ApproveWorkflowRequest(ctx contractapi.TransactionContex
 			return nil, err
 		}
 	} else if item.Type == requestTypeTransfer {
+		identityData, err := ctx.GetStub().GetState(identityBindingKey(item.TargetCustomerID))
+		if err != nil {
+			return nil, err
+		}
+		if identityData == nil {
+			return nil, fmt.Errorf("target customer %s does not have a Fabric identity", item.TargetCustomerID)
+		}
 		item.Status = statusAwaitingCustomer
 	} else {
 		return nil, fmt.Errorf("unsupported workflow request type")

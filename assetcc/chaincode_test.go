@@ -564,6 +564,36 @@ func TestInventoryTransferWorkflowAcceptsOnlyAfterApproval(t *testing.T) {
 	}
 }
 
+func TestInventoryTransferApprovalRequiresTargetFabricIdentity(t *testing.T) {
+	context, stub := newTestContext(t)
+	contract := new(SmartContract)
+	createWorkflowTestUsers(t, context, contract)
+	if err := contract.CreateAsset(context, "SKU-ID-GATE", "Phone", "Electronics", "STORE", 1000, "Active", "", "", 2, "A001"); err != nil {
+		t.Fatalf("failed to create inventory: %v", err)
+	}
+	if _, err := contract.SubmitInventoryTransferRequest(context, "REQ-ID-GATE", "SKU-ID-GATE", "C001", 1, "SALE-ID-GATE", "S001"); err != nil {
+		t.Fatalf("transfer submission failed: %v", err)
+	}
+	binding := stub.State[identityBindingKey("C001")]
+	delete(stub.State, identityBindingKey("C001"))
+	if _, err := contract.ApproveWorkflowRequest(context, "REQ-ID-GATE", "approve", "M001"); err == nil || !strings.Contains(err.Error(), "does not have a Fabric identity") {
+		t.Fatalf("checker approved transfer without customer identity: %v", err)
+	}
+	pending, err := contract.ReadWorkflowRequest(context, "REQ-ID-GATE")
+	if err != nil || pending.Status != statusPendingApproval {
+		t.Fatalf("failed approval changed request state: %#v, %v", pending, err)
+	}
+	asset, err := contract.ReadAsset(context, "SKU-ID-GATE")
+	if err != nil || asset.ReservedQuantity != 1 || asset.Quantity != 2 {
+		t.Fatalf("failed approval changed reservation: %#v, %v", asset, err)
+	}
+	stub.State[identityBindingKey("C001")] = binding
+	approved, err := contract.ApproveWorkflowRequest(context, "REQ-ID-GATE", "approve", "M001")
+	if err != nil || approved.Status != statusAwaitingCustomer {
+		t.Fatalf("approval failed after identity binding: %#v, %v", approved, err)
+	}
+}
+
 func TestInventoryTransferRejectDeclineDuplicateAndUserReference(t *testing.T) {
 	context, _ := newTestContext(t)
 	contract := new(SmartContract)
@@ -603,6 +633,32 @@ func TestInventoryTransferRejectDeclineDuplicateAndUserReference(t *testing.T) {
 	asset, _ = contract.ReadAsset(context, "SKU-R")
 	if asset.ReservedQuantity != 0 || asset.Quantity != 6 {
 		t.Fatalf("decline did not release reservation: %#v", asset)
+	}
+}
+
+func TestTransferReservationsUseAvailableQuantityWithoutReducingTotal(t *testing.T) {
+	context, _ := newTestContext(t)
+	contract := new(SmartContract)
+	createWorkflowTestUsers(t, context, contract)
+	if err := contract.CreateAsset(context, "SKU-AVAILABLE", "Phone", "Electronics", "STORE", 1000, "Active", "", "", 5, "A001"); err != nil {
+		t.Fatalf("failed to create inventory: %v", err)
+	}
+	if _, err := contract.SubmitInventoryTransferRequest(context, "REQ-A-1", "SKU-AVAILABLE", "C001", 3, "SALE-A-1", "S001"); err != nil {
+		t.Fatalf("first reservation failed: %v", err)
+	}
+	if _, err := contract.SubmitInventoryTransferRequest(context, "REQ-A-2", "SKU-AVAILABLE", "C002", 3, "SALE-A-2", "S001"); err == nil {
+		t.Fatal("reservation exceeded available quantity")
+	}
+	asset, err := contract.ReadAsset(context, "SKU-AVAILABLE")
+	if err != nil || asset.Quantity != 5 || asset.ReservedQuantity != 3 || availableQuantity(asset) != 2 {
+		t.Fatalf("reservation did not preserve total and track availability: %#v, %v", asset, err)
+	}
+	if _, err := contract.RejectWorkflowRequest(context, "REQ-A-1", "declined", "M001"); err != nil {
+		t.Fatalf("rejection failed: %v", err)
+	}
+	asset, err = contract.ReadAsset(context, "SKU-AVAILABLE")
+	if err != nil || asset.Quantity != 5 || asset.ReservedQuantity != 0 || availableQuantity(asset) != 5 {
+		t.Fatalf("rejection did not restore availability: %#v, %v", asset, err)
 	}
 }
 
