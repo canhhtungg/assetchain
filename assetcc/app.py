@@ -596,17 +596,61 @@ def mark_identity_binding(user_id, status, error=""):
 
 
 def delete_chainlaunch_identity(binding):
-    """Delete one user-owned ChainLaunch key; 404 means it is already gone."""
+    """Delete the exact TLS/sign key pair created for one application user."""
     if not binding or not str(binding.get("key_id", "")).strip():
         return True, ""
-    result = fabric_request("DELETE", f"keys/{binding['key_id']}")
-    if result.get("success") or result.get("status_code") == 404:
-        return True, ""
-    return False, str(
-        result.get("error")
-        or response_object(result.get("data")).get("message")
-        or "ChainLaunch không thể xóa client signing key"
+
+    # Organization provisioning creates two keys while returning the signing
+    # key ID. Resolve the TLS peer by its exact deterministic name; never assume
+    # adjacent numeric IDs because concurrent provisioning can interleave them.
+    key_name = str(binding.get("key_name", "")).strip()
+    tls_name = f"{key_name}-tls-client" if key_name else ""
+    inventory = fabric_request("GET", "keys/all")
+    if not inventory.get("success"):
+        return False, str(
+            inventory.get("error")
+            or response_object(inventory.get("data")).get("message")
+            or "Không thể đối soát TLS key trong ChainLaunch"
+        )
+    inventory_data = inventory.get("data")
+    for _ in range(4):
+        if isinstance(inventory_data, dict) and isinstance(
+            inventory_data.get("data"), (dict, list)
+        ):
+            inventory_data = inventory_data["data"]
+        elif isinstance(inventory_data, dict) and isinstance(
+            inventory_data.get("result"), (dict, list)
+        ):
+            inventory_data = inventory_data["result"]
+        else:
+            break
+    items = inventory_data.get("items", []) if isinstance(inventory_data, dict) else inventory_data
+    if not isinstance(items, list):
+        return False, "ChainLaunch trả về danh sách key không hợp lệ"
+    tls_id = next(
+        (
+            str(item.get("id")) for item in items
+            if isinstance(item, dict) and tls_name
+            and hmac.compare_digest(str(item.get("name", "")), tls_name)
+        ),
+        "",
     )
+
+    key_ids = []
+    if tls_id:
+        key_ids.append(("TLS", tls_id))
+    key_ids.append(("signing", str(binding["key_id"])))
+    errors = []
+    for key_type, key_id in key_ids:
+        result = fabric_request("DELETE", f"keys/{key_id}")
+        if not result.get("success") and result.get("status_code") != 404:
+            message = str(
+                result.get("error")
+                or response_object(result.get("data")).get("message")
+                or f"ChainLaunch không thể xóa {key_type} key"
+            )
+            errors.append(f"{key_type}: {message}")
+    return not errors, "; ".join(errors)
 
 
 def identity_request_is_processing(user_id):
@@ -2993,14 +3037,14 @@ def delete_user(user_id):
         }), 409
 
     # DeleteUser atomically removes the current ledger identity binding. The
-    # ChainLaunch key is deleted only after that transaction commits, avoiding
-    # an unusable user if ledger validation rejects the deletion.
+    # ChainLaunch TLS/sign key pair is deleted only after that transaction
+    # commits, avoiding an unusable user if ledger validation rejects deletion.
     cancel_fabric_identity_requests(user_id, actor_id)
     key_deleted, cleanup_error = delete_chainlaunch_identity(binding)
     if binding:
         mark_identity_binding(
             user_id, "revoked",
-            "ledger user and ChainLaunch key deleted" if key_deleted
+            "ledger user and ChainLaunch TLS/sign keys deleted" if key_deleted
             else f"ledger user deleted; key cleanup pending: {cleanup_error}",
         )
     audit_event(
@@ -3017,7 +3061,7 @@ def delete_user(user_id):
         "message": (
             "Xóa người dùng và Fabric identity thành công" if key_deleted
             else "Đã xóa user và thu hồi identity trên ledger; "
-                 "client key ChainLaunch cần được dọn lại"
+                 "client key pair ChainLaunch cần được dọn lại"
         ),
         "identityDeleted": key_deleted,
     }

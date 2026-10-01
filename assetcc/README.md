@@ -106,10 +106,12 @@ reconciliation instead of creating another key. Until approval succeeds,
 
 Deleting a user first submits `DeleteUser`, which removes the current user,
 credential and identity binding from Fabric world state in one transaction. Only
-after that transaction commits does the backend delete the user's dedicated
-ChainLaunch key through `DELETE /keys/<keyID>` and mark the local audit binding
-`revoked`. Historical ledger blocks remain immutable. If ChainLaunch cleanup
-fails, the removed on-ledger binding already prevents the orphan key from
+after that transaction commits does the backend enumerate ChainLaunch keys,
+resolve the exact `<keyName>-tls-client` peer, and delete both the TLS and
+signing keys through `DELETE /keys/<keyID>`. It never guesses adjacent IDs.
+The local audit binding is then marked `revoked`. Historical ledger blocks
+remain immutable. If ChainLaunch cleanup fails, the removed on-ledger binding
+already prevents any orphan key from
 signing business mutations, and the API reports that key cleanup is pending.
 
 Do not use the normal provisioning endpoint to replace an identity. It rejects

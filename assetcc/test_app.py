@@ -663,18 +663,32 @@ class AuthenticationApiTest(unittest.TestCase):
         })
         token = backend.auth_serializer().dumps(dict(id="U001", role="ADMIN"))
         invoke.return_value = {"success": True, "data": {"status": "success"}}
-        fabric_request.return_value = {"success": True, "status_code": 204, "data": {}}
+        fabric_request.side_effect = [
+            {
+                "success": True, "status_code": 200,
+                "data": {"items": [
+                    {"id": 31, "name": "assetchain-U002-tls-client"},
+                    {"id": "user-key-2", "name": "assetchain-U002-sign-client"},
+                ]},
+            },
+            {"success": True, "status_code": 204, "data": {}},
+            {"success": True, "status_code": 204, "data": {}},
+        ]
         response = self.client.delete(
             "/api/users/U002",
             headers={"Authorization": f"Bearer {token}"},
         )
         self.assertEqual(response.status_code, 200)
         invoke.assert_called_once_with("DeleteUser", ["U002", "U001"])
-        fabric_request.assert_called_once_with("DELETE", "keys/user-key-2")
+        self.assertEqual(
+            [call.args for call in fabric_request.call_args_list],
+            [("GET", "keys/all"), ("DELETE", "keys/31"),
+             ("DELETE", "keys/user-key-2")],
+        )
         self.assertTrue(response.get_json()["identityDeleted"])
         binding = backend.identity_binding("U002", include_inactive=True)
         self.assertEqual(binding["status"], "revoked")
-        self.assertIn("key deleted", binding["last_error"])
+        self.assertIn("TLS/sign keys deleted", binding["last_error"])
 
     @patch("app.fabric_request")
     @patch("app.invoke_chaincode")
@@ -688,10 +702,19 @@ class AuthenticationApiTest(unittest.TestCase):
             "key_name": "assetchain-U003", "status": "active",
         })
         invoke.return_value = {"success": True, "data": {"status": "success"}}
-        fabric_request.return_value = {
-            "success": False, "status_code": 500,
-            "error": "temporary ChainLaunch failure",
-        }
+        fabric_request.side_effect = [
+            {
+                "success": True, "status_code": 200,
+                "data": {"items": [
+                    {"id": 33, "name": "assetchain-U003-tls-client"},
+                ]},
+            },
+            {
+                "success": False, "status_code": 500,
+                "error": "temporary TLS cleanup failure",
+            },
+            {"success": True, "status_code": 204, "data": {}},
+        ]
         token = backend.auth_serializer().dumps(dict(id="U001", role="ADMIN"))
         response = self.client.delete(
             "/api/users/U003", headers={"Authorization": f"Bearer {token}"}
