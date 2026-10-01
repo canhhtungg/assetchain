@@ -615,3 +615,23 @@ func TestLegacyAssetDefaultsReservedQuantityToZero(t *testing.T) {
 		t.Fatalf("legacy reservation default failed: %#v, %v", asset, err)
 	}
 }
+
+func TestWorkflowRequestJSONIncludesEmptySchemaFields(t *testing.T) {
+	data, err := json.Marshal(&WorkflowRequest{ID: "REQ-SCHEMA", Type: requestTypeCreation, Status: statusPendingApproval})
+	if err != nil {
+		t.Fatalf("marshal workflow request: %v", err)
+	}
+	var payload map[string]interface{}
+	if err := json.Unmarshal(data, &payload); err != nil {
+		t.Fatalf("unmarshal workflow request: %v", err)
+	}
+	for _, field := range []string{
+		"newAssetID", "targetCustomerID", "name", "assetType", "ownerID", "value",
+		"assetStatus", "serialNumber", "description", "checkerID", "checkedAt",
+		"customerActorID", "customerActedAt", "reason",
+	} {
+		if _, ok := payload[field]; !ok {
+			t.Fatalf("workflow response omitted schema-required field %q: %s", field, data)
+		}
+	}
+}

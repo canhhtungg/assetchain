@@ -271,23 +271,23 @@ type WorkflowRequest struct {
 	Status           string `json:"status"`
 	MakerID          string `json:"makerID"`
 	AssetID          string `json:"assetID"`
-	NewAssetID       string `json:"newAssetID,omitempty"`
-	TargetCustomerID string `json:"targetCustomerID,omitempty"`
+	NewAssetID       string `json:"newAssetID"`
+	TargetCustomerID string `json:"targetCustomerID"`
 	Quantity         int    `json:"quantity"`
-	Name             string `json:"name,omitempty"`
-	AssetType        string `json:"assetType,omitempty"`
-	OwnerID          string `json:"ownerID,omitempty"`
-	Value            int    `json:"value,omitempty"`
-	AssetStatus      string `json:"assetStatus,omitempty"`
-	SerialNumber     string `json:"serialNumber,omitempty"`
-	Description      string `json:"description,omitempty"`
+	Name             string `json:"name"`
+	AssetType        string `json:"assetType"`
+	OwnerID          string `json:"ownerID"`
+	Value            int    `json:"value"`
+	AssetStatus      string `json:"assetStatus"`
+	SerialNumber     string `json:"serialNumber"`
+	Description      string `json:"description"`
 	CreatedAt        string `json:"createdAt"`
 	UpdatedAt        string `json:"updatedAt"`
-	CheckerID        string `json:"checkerID,omitempty"`
-	CheckedAt        string `json:"checkedAt,omitempty"`
-	CustomerActorID  string `json:"customerActorID,omitempty"`
-	CustomerActedAt  string `json:"customerActedAt,omitempty"`
-	Reason           string `json:"reason,omitempty"`
+	CheckerID        string `json:"checkerID"`
+	CheckedAt        string `json:"checkedAt"`
+	CustomerActorID  string `json:"customerActorID"`
+	CustomerActedAt  string `json:"customerActedAt"`
+	Reason           string `json:"reason"`
 }
 
 func workflowRequestKey(id string) string   { return workflowRequestPrefix + strings.TrimSpace(id) }
