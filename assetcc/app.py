@@ -2,12 +2,10 @@ import os
 import json
 import logging
 import requests
-import base64
 import hashlib
 import hmac
 import sqlite3
 import ssl
-import struct
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 from functools import wraps
@@ -178,12 +176,6 @@ FABRIC_IDENTITY_ORGANIZATION_ID = os.getenv(
     "FABRIC_IDENTITY_ORGANIZATION_ID", "1"
 ).strip()
 IDEMPOTENCY_TTL = int(os.getenv("IDEMPOTENCY_TTL", "86400"))
-MFA_TOTP_SECRETS_FILE = os.getenv("MFA_TOTP_SECRETS_FILE", "").strip()
-MFA_REQUIRED_ROLES = {
-    role.strip().lower()
-    for role in os.getenv("MFA_REQUIRED_ROLES", "").split(",")
-    if role.strip()
-}
 AUTH_CREDENTIALS_FILE = os.getenv("AUTH_CREDENTIALS_FILE")
 ROLE_PERMISSIONS_FILE = os.getenv("ROLE_PERMISSIONS_FILE") or str(
     Path(__file__).with_name("role-permissions.local.json")
@@ -603,6 +595,49 @@ def mark_identity_binding(user_id, status, error=""):
     connection.close()
 
 
+def delete_chainlaunch_identity(binding):
+    """Delete one user-owned ChainLaunch key; 404 means it is already gone."""
+    if not binding or not str(binding.get("key_id", "")).strip():
+        return True, ""
+    result = fabric_request("DELETE", f"keys/{binding['key_id']}")
+    if result.get("success") or result.get("status_code") == 404:
+        return True, ""
+    return False, str(
+        result.get("error")
+        or response_object(result.get("data")).get("message")
+        or "ChainLaunch không thể xóa client signing key"
+    )
+
+
+def identity_request_is_processing(user_id):
+    connection = identity_registry_connection()
+    if connection is None:
+        return False
+    row = connection.execute(
+        """SELECT 1 FROM fabric_identity_requests
+           WHERE user_id = ? AND status = 'processing' LIMIT 1""",
+        (str(user_id),),
+    ).fetchone()
+    connection.close()
+    return row is not None
+
+
+def cancel_fabric_identity_requests(user_id, reviewer_id):
+    connection = identity_registry_connection()
+    if connection is None:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    with connection:
+        connection.execute(
+            """UPDATE fabric_identity_requests
+               SET status = 'rejected', reviewed_at = ?, reviewed_by = ?,
+                   last_error = 'ledger user deleted'
+               WHERE user_id = ? AND status IN ('pending', 'failed')""",
+            (now, str(reviewer_id or ""), str(user_id)),
+        )
+    connection.close()
+
+
 def mutation_actor_id(function, args):
     index = MUTATION_ACTOR_ARGUMENT_INDEX.get(function)
     if index is None:
@@ -986,49 +1021,6 @@ def idempotency_put(scope, result):
              json.dumps(result, ensure_ascii=False, separators=(",", ":")), time()),
         )
     connection.close()
-
-
-def load_mfa_secrets():
-    serialized = runtime_secret("MFA_TOTP_SECRETS")
-    try:
-        if serialized:
-            configured = json.loads(serialized)
-        elif MFA_TOTP_SECRETS_FILE:
-            configured = json.loads(
-                Path(MFA_TOTP_SECRETS_FILE).read_text(encoding="utf-8")
-            )
-        else:
-            return {}
-    except (OSError, ValueError):
-        return {}
-    return {
-        str(username).strip().lower(): str(secret).replace(" ", "").upper()
-        for username, secret in configured.items()
-        if str(username).strip() and str(secret).strip()
-    } if isinstance(configured, dict) else {}
-
-
-def totp_code(secret, counter, digits=6):
-    padded = secret + "=" * ((8 - len(secret) % 8) % 8)
-    key = base64.b32decode(padded, casefold=True)
-    digest = hmac.new(key, struct.pack(">Q", counter), hashlib.sha1).digest()
-    offset = digest[-1] & 0x0F
-    value = struct.unpack(">I", digest[offset:offset + 4])[0] & 0x7FFFFFFF
-    return str(value % (10 ** digits)).zfill(digits)
-
-
-def valid_totp(secret, candidate, timestamp=None):
-    candidate = str(candidate or "").strip()
-    if len(candidate) != 6 or not candidate.isdigit():
-        return False
-    counter = int((time() if timestamp is None else timestamp) // 30)
-    try:
-        return any(
-            hmac.compare_digest(totp_code(secret, counter + drift), candidate)
-            for drift in (-1, 0, 1)
-        )
-    except (ValueError, TypeError):
-        return False
 
 
 def set_auth_cookie(response, token):
@@ -1683,27 +1675,6 @@ def login():
         }), 401
 
     user_role = normalize_role(user.get("role"))
-    mfa_secret = load_mfa_secrets().get(username.lower())
-    if user_role in MFA_REQUIRED_ROLES and not mfa_secret:
-        audit_event(
-            "authentication.login", "error", target_id=user.get("id"),
-            details={"reason": "required_mfa_not_configured"},
-        )
-        return jsonify({
-            "status": "error",
-            "message": "Tài khoản bắt buộc MFA nhưng chưa được cấp TOTP secret"
-        }), 503
-    if mfa_secret and not valid_totp(mfa_secret, body.get("otp")):
-        record_login_failure(attempt_key)
-        audit_event(
-            "authentication.login", "failure", target_id=user.get("id"),
-            details={"username": username.lower(), "reason": "invalid_mfa"},
-        )
-        return jsonify({
-            "status": "error", "code": "MFA_REQUIRED",
-            "message": "Mã xác thực MFA không hợp lệ"
-        }), 401
-
     clear_login_failures(attempt_key)
     user["role"] = user_role.upper()
     user_id = str(user.get("id", ""))
@@ -3000,15 +2971,20 @@ def update_user(user_id):
 @app.route("/api/users/<user_id>", methods=["DELETE"])
 @require_auth(admin_only=True)
 def delete_user(user_id):
-    if str(request.auth_user.get("id")) == str(user_id):
+    actor_id = str(request.auth_user.get("id", ""))
+    if actor_id == str(user_id):
         return jsonify({
             "status": "error",
             "message": "Admin không thể tự xóa tài khoản đang đăng nhập"
         }), 400
+    if identity_request_is_processing(user_id):
+        return jsonify({
+            "status": "error",
+            "message": "Fabric identity của user đang được cấp; hãy chờ thao tác hoàn tất"
+        }), 409
 
-    result = invoke_chaincode(
-        "DeleteUser", [str(user_id), str(request.auth_user.get("id", ""))]
-    )
+    binding = identity_binding(user_id, include_inactive=True)
+    result = invoke_chaincode("DeleteUser", [str(user_id), actor_id])
     if not result.get("success"):
         return jsonify({
             "status": "error",
@@ -3016,16 +2992,38 @@ def delete_user(user_id):
             "fabric_response": result
         }), 409
 
-    if identity_binding(user_id, include_inactive=True):
-        mark_identity_binding(user_id, "revoked", "ledger user deleted")
+    # DeleteUser atomically removes the current ledger identity binding. The
+    # ChainLaunch key is deleted only after that transaction commits, avoiding
+    # an unusable user if ledger validation rejects the deletion.
+    cancel_fabric_identity_requests(user_id, actor_id)
+    key_deleted, cleanup_error = delete_chainlaunch_identity(binding)
+    if binding:
+        mark_identity_binding(
+            user_id, "revoked",
+            "ledger user and ChainLaunch key deleted" if key_deleted
+            else f"ledger user deleted; key cleanup pending: {cleanup_error}",
+        )
     audit_event(
-        "user.delete", "success", request.auth_user.get("id"),
-        request.auth_user.get("role"), user_id,
+        "user.delete", "success" if key_deleted else "partial",
+        actor_id, request.auth_user.get("role"), user_id,
+        {
+            "fabricIdentityDeleted": key_deleted,
+            "keyID": str((binding or {}).get("key_id", "")),
+            "cleanupError": cleanup_error,
+        },
     )
-    return jsonify({
+    response = {
         "status": "success",
-        "message": "Xóa người dùng thành công"
-    })
+        "message": (
+            "Xóa người dùng và Fabric identity thành công" if key_deleted
+            else "Đã xóa user và thu hồi identity trên ledger; "
+                 "client key ChainLaunch cần được dọn lại"
+        ),
+        "identityDeleted": key_deleted,
+    }
+    if cleanup_error:
+        response["warning"] = cleanup_error
+    return jsonify(response)
 
 
 # ==========================================

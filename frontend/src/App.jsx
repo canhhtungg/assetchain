@@ -172,7 +172,6 @@ function App() {
 
   const [loginUsername, setLoginUsername] = useState("");
   const [loginPassword, setLoginPassword] = useState("");
-  const [loginOtp, setLoginOtp] = useState("");
   const [loginLoading, setLoginLoading] = useState(false);
   const [firstLoginPassword, setFirstLoginPassword] = useState("");
   const [permissions, setPermissions] = useState([]);
@@ -1003,7 +1002,7 @@ useEffect(() => {
       }
       await Promise.all([loadUsers(), loadAssets()]);
       setConfirmDialog(null);
-      setNotice(`Đã xóa người dùng ${user.username || user.id}`);
+      setNotice(result.message || `Đã xóa người dùng ${user.username || user.id}`);
     } catch (error) {
       console.error(error);
       setNotice(error.message || "Không thể xóa người dùng");
@@ -1378,7 +1377,7 @@ useEffect(() => {
       const response = await apiFetch(`${API_URL}/api/auth/login`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ username, password: enteredPassword, otp: loginOtp.trim() }),
+        body: JSON.stringify({ username, password: enteredPassword }),
       });
       const payload = await response.json();
       if (!response.ok) {
@@ -1392,7 +1391,6 @@ useEffect(() => {
       sessionStorage.setItem("assetchain-session", JSON.stringify({ user, token: csrfToken }));
       setLoginUsername("");
       setLoginPassword("");
-      setLoginOtp("");
       setPage("dashboard");
     } catch (error) {
       console.error(error);
@@ -2488,24 +2486,6 @@ useEffect(() => {
                 background: "#f9fafb",
                 color: "#111827",
                 fontSize: "16px",
-              }}
-            />
-          </div>
-
-          <div style={{ width: "100%", marginTop: "14px" }}>
-            <input
-              inputMode="numeric"
-              autoComplete="one-time-code"
-              maxLength={6}
-              value={loginOtp}
-              onChange={(event) => setLoginOtp(event.target.value.replace(/\D/g, ""))}
-              placeholder="Mã MFA 6 số (nếu đã bật)"
-              aria-label="Mã MFA"
-              style={{
-                display: "block", width: "100%", height: "52px",
-                boxSizing: "border-box", padding: "0 16px",
-                border: "1px solid #d1d5db", borderRadius: "10px",
-                background: "#f9fafb", color: "#111827", fontSize: "16px",
               }}
             />
           </div>

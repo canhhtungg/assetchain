@@ -104,6 +104,14 @@ certificate data to create a binding, retries fail closed and require operator
 reconciliation instead of creating another key. Until approval succeeds,
 `ENFORCE_FABRIC_IDENTITY_LOGIN=1` prevents that user from signing in.
 
+Deleting a user first submits `DeleteUser`, which removes the current user,
+credential and identity binding from Fabric world state in one transaction. Only
+after that transaction commits does the backend delete the user's dedicated
+ChainLaunch key through `DELETE /keys/<keyID>` and mark the local audit binding
+`revoked`. Historical ledger blocks remain immutable. If ChainLaunch cleanup
+fails, the removed on-ledger binding already prevents the orphan key from
+signing business mutations, and the API reports that key cleanup is pending.
+
 Do not use the normal provisioning endpoint to replace an identity. It rejects
 an existing local binding. Rotation requires an explicit operator workflow
 using `RotateUserIdentity`, reconciliation of both stores, and revocation or

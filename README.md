@@ -49,7 +49,6 @@ Admin có thể thay đổi ma trận quyền tại trang **Phân quyền**. Quy
 ### Xác thực và bảo mật
 
 - Phiên đăng nhập được ký bởi backend và lưu trong cookie `HttpOnly`, `Secure`, `SameSite`; CSRF token riêng chỉ giữ trong `sessionStorage`.
-- TOTP MFA có thể bật theo tài khoản và bắt buộc theo vai trò.
 - Mutating request dùng `Idempotency-Key`; backend lưu kết quả thành công trong SQLite dùng chung giữa các Gunicorn worker.
 - Bắt buộc đổi mật khẩu trong lần đăng nhập đầu tiên hoặc sau khi Admin đặt lại mật khẩu.
 - Mật khẩu đang dùng trong luồng đổi mật khẩu lần đầu chỉ tồn tại trong React state/RAM.
@@ -302,8 +301,6 @@ Các biến quan trọng:
 | `AUTH_RETURN_BEARER_TOKEN` | Cờ tương thích frontend cũ; đặt `0` ngay sau khi frontend cookie-session đã phát hành |
 | `SECURITY_STATE_DB` | SQLite dùng chung cho rate limit và idempotency trên một host |
 | `IDEMPOTENCY_TTL` | Thời gian giữ kết quả idempotency, mặc định 24 giờ |
-| `MFA_TOTP_SECRETS_FILE` | JSON username → TOTP Base32 cho development; production ưu tiên systemd credential |
-| `MFA_REQUIRED_ROLES` | Các vai trò bắt buộc MFA sau khi đã cấp secret cho toàn bộ tài khoản |
 
 Ba biến `IDENTITY_BOOTSTRAP_USER_ID`, `IDENTITY_BOOTSTRAP_MSP_ID` và
 `IDENTITY_BOOTSTRAP_CERT_FINGERPRINT` chỉ thuộc runtime external chaincode.
@@ -338,7 +335,7 @@ chmod 600 ~/.config/assetchain/credentials/APP_SECRET
 
 `APP_SECRET` phải là giá trị ngẫu nhiên mạnh, ổn định giữa các lần restart. Thay đổi giá trị này sẽ làm mất hiệu lực tất cả phiên đang đăng nhập.
 
-Trên host hỗ trợ `systemd-creds`, ưu tiên tạo credential mã hóa at-rest và dùng mẫu `assetcc/systemd/credentials-encrypted.conf.example`. Không commit file `.cred`; việc tạo/rotate phải thực hiện trực tiếp trên host qua quy trình quản trị bí mật. Có thể đặt toàn bộ JSON TOTP vào credential `MFA_TOTP_SECRETS` để backend đọc từ `$CREDENTIALS_DIRECTORY`.
+Trên host hỗ trợ `systemd-creds`, ưu tiên tạo credential mã hóa at-rest và dùng mẫu `assetcc/systemd/credentials-encrypted.conf.example`. Không commit file `.cred`; việc tạo/rotate phải thực hiện trực tiếp trên host qua quy trình quản trị bí mật.
 
 Service tham chiếu:
 
@@ -485,7 +482,6 @@ Mỗi audit event có timestamp, event, outcome, actor, target, request ID, clie
 Các kiểm soát có thể chứng minh bằng source/test trong repository:
 
 - Cookie phiên `HttpOnly` thay cho bearer token trong `localStorage`; mọi mutation qua cookie phải có `X-CSRF-Token`.
-- TOTP MFA thuần backend, cửa sổ lệch thời gian ±30 giây; có thể buộc theo vai trò.
 - `Idempotency-Key` cho các hàm chaincode ghi; kết quả thành công được replay thay vì gửi lại giao dịch.
 - Rate limit đăng nhập/reset dùng SQLite khi `SECURITY_STATE_DB` được cấu hình, nên nhiều Gunicorn worker trên cùng host dùng chung trạng thái.
 - Password hash mới nằm trong Fabric PDC `userCredentials`; có hàm migrate dữ liệu `AUTH_*` cũ khỏi world state hiện hành.

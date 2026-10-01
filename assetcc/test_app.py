@@ -17,8 +17,6 @@ class AuthenticationApiTest(unittest.TestCase):
         self.previous_auth_state_file = backend.AUTH_STATE_FILE
         self.previous_security_state_db = backend.SECURITY_STATE_DB
         self.previous_identity_registry_db = backend.IDENTITY_REGISTRY_DB
-        self.previous_mfa_file = backend.MFA_TOTP_SECRETS_FILE
-        self.previous_mfa_roles = backend.MFA_REQUIRED_ROLES
         self.previous_cookie_secure = backend.AUTH_COOKIE_SECURE
         self.previous_return_bearer = backend.AUTH_RETURN_BEARER_TOKEN
         self.previous_enforce_identity_login = backend.ENFORCE_FABRIC_IDENTITY_LOGIN
@@ -37,8 +35,6 @@ class AuthenticationApiTest(unittest.TestCase):
         backend.IDENTITY_REGISTRY_DB = os.path.join(
             self.permissions_directory.name, "identity-registry.sqlite3"
         )
-        backend.MFA_TOTP_SECRETS_FILE = ""
-        backend.MFA_REQUIRED_ROLES = set()
         backend.AUTH_COOKIE_SECURE = False
         backend.AUTH_RETURN_BEARER_TOKEN = False
         backend.ENFORCE_FABRIC_IDENTITY_LOGIN = False
@@ -54,8 +50,6 @@ class AuthenticationApiTest(unittest.TestCase):
         backend.AUTH_STATE_FILE = self.previous_auth_state_file
         backend.SECURITY_STATE_DB = self.previous_security_state_db
         backend.IDENTITY_REGISTRY_DB = self.previous_identity_registry_db
-        backend.MFA_TOTP_SECRETS_FILE = self.previous_mfa_file
-        backend.MFA_REQUIRED_ROLES = self.previous_mfa_roles
         backend.AUTH_COOKIE_SECURE = self.previous_cookie_secure
         backend.AUTH_RETURN_BEARER_TOKEN = self.previous_return_bearer
         backend.ENFORCE_FABRIC_IDENTITY_LOGIN = self.previous_enforce_identity_login
@@ -430,27 +424,6 @@ class AuthenticationApiTest(unittest.TestCase):
         )
         self.assertEqual(accepted.status_code, 200)
 
-    @patch("app.invoke_chaincode")
-    def test_login_enforces_configured_totp(self, invoke):
-        secret = "JBSWY3DPEHPK3PXP"
-        mfa_path = os.path.join(self.permissions_directory.name, "mfa.json")
-        with open(mfa_path, "w", encoding="utf-8") as output:
-            json.dump({"admin": secret}, output)
-        backend.MFA_TOTP_SECRETS_FILE = mfa_path
-        invoke.side_effect = [
-            {"success": True, "data": {"result": generate_password_hash("correct-password")}},
-            {"success": True, "data": {"result": {
-                "id": "U001", "username": "admin", "role": "ADMIN"
-            }}},
-        ]
-        with patch("app.time", return_value=1_700_000_000):
-            code = backend.totp_code(secret, int(1_700_000_000 // 30))
-            response = self.client.post(
-                "/api/auth/login",
-                json={"username": "admin", "password": "correct-password", "otp": code},
-            )
-        self.assertEqual(response.status_code, 200)
-
     def test_shared_rate_limit_survives_in_memory_reset(self):
         key = "127.0.0.1:shared-user"
         for _ in range(backend.LOGIN_FAILURE_LIMIT):
@@ -679,8 +652,9 @@ class AuthenticationApiTest(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 401)
 
+    @patch("app.fabric_request")
     @patch("app.invoke_chaincode")
-    def test_admin_can_delete_another_user(self, invoke):
+    def test_admin_can_delete_another_user_and_chainlaunch_key(self, invoke, fabric_request):
         backend.save_identity_binding({
             "user_id": "U002", "key_id": "user-key-2",
             "organization_id": "12", "msp_id": "Org1MSP",
@@ -689,14 +663,45 @@ class AuthenticationApiTest(unittest.TestCase):
         })
         token = backend.auth_serializer().dumps(dict(id="U001", role="ADMIN"))
         invoke.return_value = {"success": True, "data": {"status": "success"}}
+        fabric_request.return_value = {"success": True, "status_code": 204, "data": {}}
         response = self.client.delete(
             "/api/users/U002",
             headers={"Authorization": f"Bearer {token}"},
         )
         self.assertEqual(response.status_code, 200)
         invoke.assert_called_once_with("DeleteUser", ["U002", "U001"])
+        fabric_request.assert_called_once_with("DELETE", "keys/user-key-2")
+        self.assertTrue(response.get_json()["identityDeleted"])
         binding = backend.identity_binding("U002", include_inactive=True)
         self.assertEqual(binding["status"], "revoked")
+        self.assertIn("key deleted", binding["last_error"])
+
+    @patch("app.fabric_request")
+    @patch("app.invoke_chaincode")
+    def test_user_delete_stays_revoked_when_chainlaunch_cleanup_fails(
+        self, invoke, fabric_request
+    ):
+        backend.save_identity_binding({
+            "user_id": "U003", "key_id": "user-key-3",
+            "organization_id": "12", "msp_id": "Org1MSP",
+            "certificate_fingerprint": "e" * 64,
+            "key_name": "assetchain-U003", "status": "active",
+        })
+        invoke.return_value = {"success": True, "data": {"status": "success"}}
+        fabric_request.return_value = {
+            "success": False, "status_code": 500,
+            "error": "temporary ChainLaunch failure",
+        }
+        token = backend.auth_serializer().dumps(dict(id="U001", role="ADMIN"))
+        response = self.client.delete(
+            "/api/users/U003", headers={"Authorization": f"Bearer {token}"}
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.get_json()["identityDeleted"])
+        self.assertIn("dọn lại", response.get_json()["message"])
+        binding = backend.identity_binding("U003", include_inactive=True)
+        self.assertEqual(binding["status"], "revoked")
+        self.assertIn("cleanup pending", binding["last_error"])
 
     @patch("app.invoke_chaincode")
     def test_admin_cannot_delete_current_account(self, invoke):

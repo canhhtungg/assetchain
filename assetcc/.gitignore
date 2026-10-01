@@ -12,4 +12,3 @@ security-state*.sqlite3-wal
 identity-registry*.sqlite3
 identity-registry*.sqlite3-shm
 identity-registry*.sqlite3-wal
-mfa*.json
