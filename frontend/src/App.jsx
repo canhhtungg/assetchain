@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import "./App.css";
 
 const API_URL =
@@ -488,9 +488,14 @@ useEffect(() => {
         apiRequest("/api/workflow/pending-counts"),
       ]);
       const items = Array.isArray(requestData.data) ? requestData.data : [];
-      setWorkflowRequests(items);
+      const newestFirst = [...items].sort((left, right) => {
+        const leftCreatedAt = Date.parse(left?.createdAt || "") || 0;
+        const rightCreatedAt = Date.parse(right?.createdAt || "") || 0;
+        return rightCreatedAt - leftCreatedAt;
+      });
+      setWorkflowRequests(newestFirst);
       setWorkflowPendingCount(Number(countData.data?.total || 0));
-      return items;
+      return newestFirst;
     } finally {
       setRequestsLoading(false);
     }
@@ -588,11 +593,10 @@ useEffect(() => {
         .toLowerCase()
         .includes(query.toLowerCase())
     );
-    if (isAdmin || isManager) {
-      return [...matching].sort((left, right) => Number(isSoldAsset(left)) - Number(isSoldAsset(right)));
-    }
-    return matching;
-  }, [visibleAssets, query, isAdmin, isManager]);
+    return [...matching].sort(
+      (left, right) => Number(isSoldAsset(left)) - Number(isSoldAsset(right))
+    );
+  }, [visibleAssets, query]);
 
 
   /*
@@ -1525,15 +1529,13 @@ useEffect(() => {
     }
   };
 
-  const logout = async () => {
-    try {
-      await apiFetch(`${API_URL}/api/auth/logout`, {
-        method: "POST",
-        headers: { "X-CSRF-Token": authToken },
-      });
-    } catch {
-      // Local cleanup still prevents the UI from retaining authenticated state.
-    }
+  const logout = () => {
+    const logoutRequest = apiFetch(`${API_URL}/api/auth/logout`, {
+      method: "POST",
+      headers: { "X-CSRF-Token": authToken },
+      keepalive: true,
+    });
+
     sessionStorage.removeItem("assetchain-session");
     setCurrentUser(null);
     setAuthToken("");
@@ -1548,8 +1550,15 @@ useEffect(() => {
     setSelected(null);
     setEditing(null);
     setModal(null);
+    setConfirmDialog(null);
+    setNotice("");
+    setLoading(false);
+    setRequestsLoading(false);
     setQuery("");
     setPage("dashboard");
+
+    // Server-side invalidation may finish after the login screen is already visible.
+    void logoutRequest.catch(() => {});
   };
 
 
@@ -2708,6 +2717,7 @@ useEffect(() => {
         <ConfirmModal
           dialog={confirmDialog}
           onClose={() => setConfirmDialog(null)}
+          onConfirmStart={() => setConfirmDialog(null)}
         />
 
         <NoticeModal
@@ -2985,6 +2995,13 @@ useEffect(() => {
       <ConfirmModal
         dialog={confirmDialog}
         onClose={() => setConfirmDialog(null)}
+        onConfirmStart={() => {
+          setConfirmDialog(null);
+          setModal(null);
+          setSelected(null);
+          setEditing(null);
+          setEditingUser(null);
+        }}
       />
 
       {modal === "asset" && (
@@ -3233,14 +3250,25 @@ useEffect(() => {
  * =====================================================
  */
 
-function ConfirmModal({ dialog, onClose }) {
+function ConfirmModal({ dialog, onClose, onConfirmStart = onClose }) {
+  const confirmingRef = useRef(false);
+
+  useEffect(() => {
+    confirmingRef.current = false;
+  }, [dialog]);
+
   if (!dialog) return null;
 
   const handleConfirm = async () => {
+    if (confirmingRef.current) return;
+    confirmingRef.current = true;
+
     if (!dialog.onConfirm) {
       onClose();
       return;
     }
+
+    onConfirmStart();
     await dialog.onConfirm();
   };
 
