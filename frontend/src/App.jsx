@@ -8,10 +8,28 @@ const API_URL =
     : "http://127.0.0.1:5000");
 const ADMIN_OWNER_ID = "U001";
 
-const apiFetch = (url, options = {}) => fetch(url, {
-  credentials: "include",
-  ...options,
+const sleep = (milliseconds) => new Promise((resolve) => {
+  window.setTimeout(resolve, milliseconds);
 });
+
+const apiFetch = async (url, options = {}) => {
+  const { retryOnNetworkError = false, ...fetchOptions } = options;
+  const retryDelays = retryOnNetworkError ? [700, 1400] : [];
+
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await fetch(url, {
+        credentials: "include",
+        ...fetchOptions,
+      });
+    } catch (error) {
+      if (!(error instanceof TypeError) || attempt >= retryDelays.length) {
+        throw error;
+      }
+      await sleep(retryDelays[attempt]);
+    }
+  }
+};
 
 const ROLE_LABELS = {
   admin: "Admin",
@@ -1445,6 +1463,7 @@ useEffect(() => {
       setLoginLoading(true);
       const enteredPassword = loginPassword;
       const response = await apiFetch(`${API_URL}/api/auth/login`, {
+        retryOnNetworkError: true,
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ username, password: enteredPassword }),
